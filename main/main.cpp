@@ -113,7 +113,7 @@ Preferences preferences;
 #if defined(ZwebUI) && defined(ESP32)
 #  include "config_WebUI.h"
 #endif
-#if defined(ZgatewayRF) || defined(ZgatewayRF2) || defined(ZgatewayPilight) || defined(ZactuatorSomfy) || defined(ZgatewayRTL_433)
+#if defined(ZgatewayRF) || defined(ZgatewayRF2) || defined(ZgatewayPilight) || defined(ZgatewaySomfy) || defined(ZgatewayRTL_433) || defined(ZgatewayFunkbus) || defined(ZactuatorFunkbus)
 #  include "config_RF.h"
 #endif
 #ifdef ZgatewayWeatherStation
@@ -214,6 +214,12 @@ Preferences preferences;
 #endif
 #ifdef ZactuatorSomfy
 #  include "config_Somfy.h"
+#endif
+#ifdef ZactuatorFunkbus
+#  include "config_Funkbus.h"
+#endif
+#ifdef ZgatewayFunkbus
+#  include "config_Funkbus.h"
 #endif
 #if defined(ZboardM5STICKC) || defined(ZboardM5STICKCP) || defined(ZboardM5STACK) || defined(ZboardM5TOUGH)
 #  include "config_M5.h"
@@ -1476,7 +1482,7 @@ void setup() {
 #endif
 
   delay(1500);
-#if defined(ZgatewayRF) || defined(ZgatewayPilight) || defined(ZgatewayRTL_433) || defined(ZgatewayRF2) || defined(ZactuatorSomfy)
+#if defined(ZgatewayRF) || defined(ZgatewayPilight) || defined(ZgatewayRTL_433) || defined(ZgatewayRF2) || defined(ZactuatorSomfy) || defined(ZgatewayFunkbus) || defined(ZactuatorFunkbus)
   setupCommonRF();
 #endif
 #ifdef ZsensorBME280
@@ -1583,6 +1589,14 @@ void setup() {
 #ifdef ZactuatorSomfy
   setupSomfy();
   modules.add(ZactuatorSomfy);
+#endif
+#ifdef ZactuatorFunkbus
+  setupFunkbus();
+  modules.add(ZactuatorFunkbus);
+#endif
+#ifdef ZgatewayFunkbus
+  setupFunkbus();
+  modules.add(ZgatewayFunkbus);
 #endif
 #ifdef ZsensorDS1820
   setupZsensorDS1820();
@@ -2731,6 +2745,9 @@ void loop() {
       launchRTL_433Discovery(false);
 #  endif
 #endif
+#ifdef ZgatewayFunkbus
+    loopFunkbus();
+#endif
   }
   // Empty the queue
   emptyQueue();
@@ -3017,7 +3034,7 @@ void receivingDATA(const char* topicOri, const char* datacallback) {
     extern void XtoPilight(const char* topicOri, JsonObject& RFdata);
     XtoPilight(strTopicOri.c_str(), jsondata);
 #endif
-#if defined(ZgatewayRTL_433) || defined(ZgatewayPilight) || defined(ZgatewayRF) || defined(ZgatewayRF2) || defined(ZactuatorSomfy)
+#if defined(ZgatewayRTL_433) || defined(ZgatewayPilight) || defined(ZgatewayRF) || defined(ZgatewayRF2) || defined(ZactuatorSomfy) || defined(ZgatewayFunkbus) || defined(ZactuatorFunkbus)
     XtoRFset(strTopicOri.c_str(), jsondata);
 #endif
 #if jsonReceiving
@@ -3063,6 +3080,9 @@ void receivingDATA(const char* topicOri, const char* datacallback) {
 #  endif
 #  ifdef ZactuatorSomfy
     XtoSomfy(strTopicOri.c_str(), jsondata);
+#  endif
+#  if defined(ZactuatorFunkbus) || defined(ZgatewayFunkbus)
+    XtoFunkbus(strTopicOri.c_str(), jsondata);
 #  endif
 #  ifdef ZgatewaySERIAL
     XtoSERIAL(strTopicOri.c_str(), jsondata);

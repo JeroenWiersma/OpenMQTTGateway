@@ -1202,10 +1202,10 @@ void handleLA() {
   response += String(buffer);
   server.send(200, "text/html", response);
 }
-#  elif defined(ZgatewayRTL_433) || defined(ZgatewayPilight) || defined(ZgatewayRF) || defined(ZgatewayRF2) || defined(ZactuatorSomfy)
+#  elif defined(ZgatewayRTL_433) || defined(ZgatewayPilight) || defined(ZgatewayRF) || defined(ZgatewayRF2) || defined(ZactuatorSomfy) || defined(ZgatewayFunkbus) || defined(ZactuatorFunkbus)
 #    include <map>
 std::map<int, String> activeReceiverOptions = {
-    {0, "Inactive"},
+    {-1, "Inactive"}, // must match ACTIVE_NONE
 #    if defined(ZgatewayPilight) && !defined(ZradioSX127x)
     {1, "PiLight"},
 #    endif
@@ -1281,16 +1281,18 @@ void handleRF() {
           THEENGS_LOG_WARNING(F("[WebUI] Invalid Frequency" CR));
         }
       }
+      #if !defined(ZgatewayFunkbus) && !defined(ZactuatorFunkbus)
       if (server.hasArg("ar")) {
         int selectedReceiver = server.arg("ar").toInt();
         if (isValidReceiver(selectedReceiver)) { // Assuming isValidReceiver is a validation function
           RFConfig.activeReceiver = selectedReceiver;
-          WEBtoRF["activereceiver"] = RFConfig.activeReceiver;
+          WEBtoRF["active"] = RFConfig.activeReceiver;
           update = true;
         } else {
           THEENGS_LOG_WARNING(F("[WebUI] Invalid Active Receiver" CR));
         }
       }
+      #endif
       if (server.hasArg("oo")) {
         RFConfig.newOokThreshold = server.arg("oo").toInt();
         WEBtoRF["ookthreshold"] = RFConfig.newOokThreshold;
@@ -1499,7 +1501,7 @@ void handleIN() {
     informationDisplay += "1<BR>LORA}2}1";
     informationDisplay += stateLORAMeasures();
 #  endif
-#  if defined(ZgatewayRF)
+#  if defined(ZgatewayRF) || defined(ZgatewayFunkbus) || defined(ZactuatorFunkbus)
     informationDisplay += "1<BR>RF}2}1";
     informationDisplay += stateRFMeasures();
 #  endif
@@ -1768,7 +1770,7 @@ void WebUISetup() {
   server.on("/wu", handleWU); // Configure WebUI
 #  ifdef ZgatewayLORA
   server.on("/la", handleLA); // Configure LORA
-#  elif defined(ZgatewayRTL_433) || defined(ZgatewayPilight) || defined(ZgatewayRF) || defined(ZgatewayRF2) || defined(ZactuatorSomfy)
+#  elif defined(ZgatewayRTL_433) || defined(ZgatewayPilight) || defined(ZgatewayRF) || defined(ZgatewayRF2) || defined(ZactuatorSomfy) || defined(ZgatewayFunkbus) || defined(ZactuatorFunkbus)
   server.on("/rf", handleRF); // Configure RF
 #  endif
 #  if defined(ZgatewayCloud)
