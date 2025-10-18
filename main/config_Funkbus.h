@@ -36,10 +36,14 @@
 #  endif
 
 // ============================================================================
-// 2) DEFAULT LISTEN FREQUENCY — boot-time RX frequency
+// 2) DEFAULT FREQUENCIES — boot-time RX and TX frequency
 // ============================================================================
 #  ifndef FUNKBUS_DEFAULT_LISTEN_MHZ
 #    define FUNKBUS_DEFAULT_LISTEN_MHZ 433.42f // MHz; OMG runtime config may override
+#  endif
+
+#  ifndef FUNKBUS_TX_MHZ
+#    define FUNKBUS_TX_MHZ 433.42f
 #  endif
 
 // ============================================================================

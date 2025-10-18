@@ -929,7 +929,7 @@ void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
     frames_ptr.push_back(frames_buf[i].data());
   }
 
-  TxFreqGuard _guard(FunkbusTB::GetListenMhz());
+  TxFreqGuard _guard(FUNKBUS_TX_MHZ);
   FunkbusTB::beginTxSession();
 
 #  if FUNKBUS_LED_TX_ENABLE

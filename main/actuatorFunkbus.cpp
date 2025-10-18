@@ -26,8 +26,9 @@
 // --- Project headers --------------------------------------------------------
 #  include "config_Funkbus.h"
 #  include "modules/funkbus/funkbus_cc1101_toolbox.h"
-#  include "modules/funkbus/funkbus_tx.h"
 #  include "modules/funkbus/funkbus_log.h"
+#  include "modules/funkbus/funkbus_tx.h"
+
 
 // --- Init guard -------------------------------------------------------------
 
@@ -87,9 +88,8 @@ void XtoFunkbus(const char* topic, JsonObject& root) {
   }
 
   const double mhz = FunkbusTB::GetListenMhz();
-  FB_VLOG(
-      F("Transmit frequency: %F -> restore to %F" CR),
-      mhz, mhz);
+  const double txmhz = (double)FUNKBUS_TX_MHZ;
+  FB_VLOG(F("Transmit frequency: %F -> restore to %F" CR), txmhz, mhz);
 
   FunkbusRemote::Create_and_TransmitFrames(
       bits40, p.channel, p.button, p.action, p.duration);
