@@ -24,7 +24,30 @@
 
 #include "User_config.h"
 
-#if defined(ZgatewayRF) || defined(ZgatewayPilight) || defined(ZgatewayRTL_433) || defined(ZgatewayRF2) || defined(ZactuatorSomfy)
+// ADJUSTED for funkbus
+#if defined(ZgatewayRF) || defined(ZgatewayPilight) || defined(ZgatewayRTL_433) || defined(ZgatewayRF2) || defined(ZactuatorSomfy) || defined(ZgatewayFunkbus) || defined(ZactuatorFunkbus)
+
+// NEW for funkbus
+#  ifdef ZgatewayFunkbus || defined(ZactuatorFunkbus)
+#    include "modules/funkbus/funkbus_cc1101_toolbox.h"
+
+// Mirror a frequency contained in the JSON payload into Funkbus cache.
+// No radio I/O here; OMG core remains the single source of truth.
+static inline void FB_MirrorListenMHz_fromJson(JsonObject& obj) {
+  float mhz = NAN;
+  if (obj.containsKey("frequency"))
+    mhz = obj["frequency"].as<float>();
+  else if (obj.containsKey("mhz"))
+    mhz = obj["mhz"].as<float>();
+  else if (obj.containsKey("receiver_frequency"))
+    mhz = obj["receiver_frequency"].as<float>();
+  if (!isnan(mhz)) {
+    FunkbusTB::SetListenMhz(mhz);
+  }
+}
+#  else
+static inline void FB_MirrorListenMHz_fromJson(JsonObject&) {}
+#  endif
 
 #  ifdef ZradioCC1101
 #    include <ELECHOUSE_CC1101_SRC_DRV.h>
@@ -54,7 +77,13 @@ void initCC1101() {
     if (ELECHOUSE_cc1101.getCC1101()) {
       THEENGS_LOG_NOTICE(F("C1101 spi Connection OK" CR));
       ELECHOUSE_cc1101.Init();
+
+      // Funkbus builds: tune PLL only; don't apply OMG's generic RX profile
+#    if defined(ZgatewayFunkbus) || defined(ZactuatorFunkbus)
+      ELECHOUSE_cc1101.setMHZ(RFConfig.frequency);
+#    else
       ELECHOUSE_cc1101.SetRx(RFConfig.frequency);
+#    endif
       break;
     } else {
       THEENGS_LOG_ERROR(F("C1101 spi Connection Error" CR));
@@ -173,6 +202,9 @@ void enableActiveReceiver() {
       currentReceiver = ACTIVE_RF2;
       break;
 #  endif
+    case ACTIVE_NONE:
+      // Do nothing; RF is intentionally inactive
+      break;
     case ACTIVE_RECERROR:
       THEENGS_LOG_ERROR(F("ERROR: no receiver selected" CR));
       break;
@@ -217,7 +249,16 @@ void RFConfig_fromJson(JsonObject& RFdata) {
     Config_update(RFdata, "frequency", RFConfig.frequency);
     THEENGS_LOG_NOTICE(F("RF Receive mhz: %F" CR), RFConfig.frequency);
     success = true;
+
+    // >>> NEW: apply immediately for Funkbus builds (PLL only) + mirror cache
+#  if defined(ZgatewayFunkbus) || defined(ZactuatorFunkbus)
+    ELECHOUSE_cc1101.setMHZ(RFConfig.frequency);
+    FunkbusTB::SetListenMhz(RFConfig.frequency);
+#  endif
+    // <<< NEW
   }
+  // // Mirror to Funkbus at boot or whenever JSON carries a frequency
+  // FB_MirrorListenMHz_fromJson(RFdata);
   if (RFdata.containsKey("active")) {
     THEENGS_LOG_NOTICE(F("RF receiver active: %d" CR), RFConfig.activeReceiver);
     Config_update(RFdata, "active", RFConfig.activeReceiver);
@@ -247,8 +288,10 @@ void RFConfig_fromJson(JsonObject& RFdata) {
     THEENGS_LOG_ERROR(F("MQTTtoRF Fail json" CR));
   }
 #  endif
+#  if defined(ZgatewayPilight) || defined(ZgatewayRF) || defined(ZgatewayRTL_433) || defined(ZgatewayRF2)
   disableCurrentReceiver();
   enableActiveReceiver();
+#  endif
 #  ifdef ESP32
   if (RFdata.containsKey("erase") && RFdata["erase"].as<bool>()) {
     // Erase config from NVS (non-volatile storage)
@@ -308,14 +351,32 @@ void RFConfig_load() {
     }
     JsonObject jo = jsonBuffer.as<JsonObject>();
     RFConfig_fromJson(jo);
+
+// NEW (Funkbus): mirror the loaded frequency to Funkbus cache.
+#    if defined(ZgatewayFunkbus) || defined(ZactuatorFunkbus)
+    FunkbusTB::SetListenMhz(RFConfig.frequency);
+    ELECHOUSE_cc1101.setMHZ(RFConfig.frequency);
+#    endif
+
     THEENGS_LOG_NOTICE(F("RF Config loaded" CR));
   } else {
     preferences.end();
     THEENGS_LOG_NOTICE(F("RF Config not found using default" CR));
     enableActiveReceiver();
+
+// NEW (Funkbus): also mirror/tune the default frequency.
+#    if defined(ZgatewayFunkbus) || defined(ZactuatorFunkbus)
+    FunkbusTB::SetListenMhz(RFConfig.frequency);
+    ELECHOUSE_cc1101.setMHZ(RFConfig.frequency);
+#    endif
   }
 #  else
   enableActiveReceiver();
+// NEW (Funkbus): mirror/tune defaults on non-ESP32 too (no NVS).
+#    if defined(ZgatewayFunkbus) || defined(ZactuatorFunkbus)
+  FunkbusTB::SetListenMhz(RFConfig.frequency);
+  ELECHOUSE_cc1101.setMHZ(RFConfig.frequency);
+#    endif
 #  endif
 }
 
@@ -339,6 +400,10 @@ void XtoRFset(const char* topicOri, JsonObject& RFdata) {
 
     // Load config from json if available
     RFConfig_fromJson(RFdata);
+
+    // NEW for Funkbus: mirror any provided frequency into Funkbus cache (no extra I/O)
+    FB_MirrorListenMHz_fromJson(RFdata);
+
     stateRFMeasures();
   }
 }

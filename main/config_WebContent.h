@@ -57,7 +57,7 @@
 #define configure_5 "<p><form action='lo' method='get'><button>Configure Logging</button></form></p>"
 #ifdef ZgatewayLORA
 #  define configure_6 "<p><form action='la' method='get'><button>Configure LORA</button></form></p>"
-#elif defined(ZgatewayRTL_433) || defined(ZgatewayPilight) || defined(ZgatewayRF) || defined(ZgatewayRF2) || defined(ZactuatorSomfy)
+#elif defined(ZgatewayRTL_433) || defined(ZgatewayPilight) || defined(ZgatewayRF) || defined(ZgatewayRF2) || defined(ZactuatorSomfy) || defined(ZgatewayFunkbus) || defined(ZactuatorFunkbus)
 #  define configure_6 "<p><form action='rf' method='get'><button>Configure RF</button></form></p>"
 #else
 #  define configure_6
@@ -140,9 +140,11 @@ const char config_rf_body[] = body_header
     "<p><b>Frequency</b><br>"
     "<input type='number' id='rf' name='rf' step='any' value='%.3f'></p>"
 
-    // Active library dropdown
+// Active library dropdown
+#if !defined(ZgatewayFunkbus) && !defined(ZactuatorFunkbus)
     "<p><b>Active library</b><br>"
     "<select id='ar' name='ar'>%s</select></p>"
+#endif
 
     /* // Need testing
     "<p><b>OOK Threshold</b><br>"
