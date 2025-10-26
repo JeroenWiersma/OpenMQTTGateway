@@ -948,20 +948,25 @@ void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
       const uint32_t clk_main_hz = txMain.counter_hz();
 
       for (int i = 0; i < FUNKBUS_TX_FRAMES_PER_BURST; ++i) {
-        String bits = String(frames_buf[i].data());
+        const char* bits_cstr = frames_buf[i].data();
+        String bits(bits_cstr);
         String hex = BitsToHex(bits);
+
+        // Read the 3 SCOM bits from the frame
         char scom3[4];
-        scom3[0] = frames_buf[i][SCOM_START_BIT + 0];
-        scom3[1] = frames_buf[i][SCOM_START_BIT + 1];
-        scom3[2] = frames_buf[i][SCOM_START_BIT + 2];
+        scom3[0] = bits_cstr[SCOM_START_BIT + 0];
+        scom3[1] = bits_cstr[SCOM_START_BIT + 1];
+        scom3[2] = bits_cstr[SCOM_START_BIT + 2];
         scom3[3] = '\0';
-        uint8_t scom =
-            ((uint8_t)(frames_buf[i][SCOM_START_BIT + 0] == '1') << 2) |
-            ((uint8_t)(frames_buf[i][SCOM_START_BIT + 1] == '1') << 1) |
-            (uint8_t)(frames_buf[i][SCOM_START_BIT + 2] == '1');
+
+        // Decode using Funkbus mapping (left→right weights 1,2,4)
+        const uint8_t scom =
+            (scom3[0] == '1' ? 1 : 0) |
+            (scom3[1] == '1' ? 2 : 0) |
+            (scom3[2] == '1' ? 4 : 0);
 
         FB_VLOG(F("[fb tx] frame[%d] scom=%u (%s) hex=%s bits=%s" CR),
-                i, scom, scom3, hex.c_str(), frames_buf[i].data());
+                i, scom, scom3, hex.c_str(), bits_cstr);
       }
 
       SendFramesWithStateMachine48(frames_ptr, txMain, clk_main_hz);
