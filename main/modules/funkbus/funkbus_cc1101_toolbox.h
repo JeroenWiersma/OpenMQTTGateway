@@ -216,6 +216,36 @@ void endTxSession();
 // endregion
 
 // ---------------------------------------------------------------------------
+// region 7a) Raw OOK TX session (save → configure → TX → restore)
+// ---------------------------------------------------------------------------
+
+struct RawTxSession {
+  uint32_t prev_freq_hz = 0; // exact FREQ word-derived Hz before TX
+  float prev_listen_mhz = 0; // cached listen MHz (your model)
+  uint8_t prev_marc5 = MARC_IDLE; // MARC state before TX (RX/IDLE/etc.)
+  bool restore_freq = false; // set true if we changed FREQ for TX
+};
+
+/**
+ * Begin a raw OOK TX session:
+ * - snapshots current programmed frequency (Hz), cached listen MHz, and MARC state
+ * - if tx_freq_hz != 0 and differs, programs that freq (+calibrate)
+ * - applies TX profile and switches RX→TX (fast path)
+ * Leaves the device in MARC_TX (or FSTXON while settling), ready for bit-banging.
+ */
+bool rawOokBegin(RawTxSession& s, uint32_t tx_freq_hz);
+
+/**
+ * End the raw OOK TX session:
+ * - stops TX and resumes RX path
+ * - restores the exact programmed frequency if it was changed
+ * - reapplies listen MHz model and ensures MARC_RX if we were in RX before
+ * Radio ends up back in the same functional state as before Begin().
+ */
+bool rawOokEndRestore(const RawTxSession& s);
+// endregion
+
+// ---------------------------------------------------------------------------
 // region 9) Self-tests (safe, non-blocking)
 // ---------------------------------------------------------------------------
 

@@ -226,6 +226,105 @@ struct TxLedGuard {
 };
 #endif
 
+namespace FunkbusRemote {
+
+// Send one ON/OFF timings[] sequence once via GPIO (starts ON=HIGH)
+static bool SendOnOffTimingsGPIO(const std::vector<uint32_t>& timings) {
+#if defined(FUNKBUS_CC1101_GDO0_MCU)
+  pinMode(FUNKBUS_CC1101_GDO0_MCU, OUTPUT);
+  uint8_t level = HIGH; // first entry = ON
+  for (uint32_t us : timings) {
+    digitalWrite(FUNKBUS_CC1101_GDO0_MCU, level);
+    ets_delay_us(us); // precise busy wait
+    level = (level == HIGH) ? LOW : HIGH;
+  }
+  digitalWrite(FUNKBUS_CC1101_GDO0_MCU, LOW);
+  return true;
+#else
+  (void)timings;
+  return false;
+#endif
+}
+
+bool TxRawSingle(uint32_t freq_hz,
+                 const char* /*modulation*/,
+                 const std::vector<uint32_t>& timings_us,
+                 uint32_t repeats,
+                 const std::vector<uint32_t>& gaps_us) {
+#ifdef ZradioCC1101
+  FunkbusTB::RawTxSession sess{};
+  if (!FunkbusTB::rawOokBegin(sess, freq_hz)) {
+    FB_LOG_E(F("[RAW-TX] rawOokBegin failed" CR));
+    return false;
+  }
+
+  // Send repeats, holding LOW for a gap between repeats (if provided)
+  for (uint32_t i = 0; i < repeats; ++i) {
+    if (!SendOnOffTimingsGPIO(timings_us)) {
+      FB_LOG_E(F("[RAW-TX] GPIO send failed at repeat %u" CR), (unsigned)i);
+      break;
+    }
+    if (i + 1 < repeats) {
+      uint32_t gap = gaps_us.empty() ? 0U : (i < gaps_us.size() ? gaps_us[i] : gaps_us.back());
+      if (gap) {
+        pinMode(FUNKBUS_CC1101_GDO0_MCU, OUTPUT);
+        digitalWrite(FUNKBUS_CC1101_GDO0_MCU, LOW);
+        ets_delay_us(gap);
+      }
+    }
+  }
+
+  const bool ok = FunkbusTB::rawOokEndRestore(sess);
+  if (!ok) FB_LOG_W(F("[RAW-TX] restore reported issues" CR));
+  return ok;
+#else
+  (void)freq_hz;
+  (void)timings_us;
+  (void)repeats;
+  (void)gaps_us;
+  return false;
+#endif
+}
+
+bool TxRawPlaylist(uint32_t freq_hz,
+                   const char* /*modulation*/,
+                   const std::vector<std::vector<uint32_t>>& frames,
+                   const std::vector<uint32_t>& gaps_us) {
+#ifdef ZradioCC1101
+  FunkbusTB::RawTxSession sess{};
+  if (!FunkbusTB::rawOokBegin(sess, freq_hz)) {
+    FB_LOG_E(F("[RAW-TX] rawOokBegin failed" CR));
+    return false;
+  }
+
+  for (size_t i = 0; i < frames.size(); ++i) {
+    if (!SendOnOffTimingsGPIO(frames[i])) {
+      FB_LOG_E(F("[RAW-TX] GPIO send failed at frame %u" CR), (unsigned)i);
+      break;
+    }
+    if (i + 1 < frames.size()) {
+      uint32_t gap = gaps_us.empty() ? 0U : (i < gaps_us.size() ? gaps_us[i] : gaps_us.back());
+      if (gap) {
+        pinMode(FUNKBUS_CC1101_GDO0_MCU, OUTPUT);
+        digitalWrite(FUNKBUS_CC1101_GDO0_MCU, LOW);
+        ets_delay_us(gap);
+      }
+    }
+  }
+
+  const bool ok = FunkbusTB::rawOokEndRestore(sess);
+  if (!ok) FB_LOG_W(F("[RAW-TX] restore reported issues" CR));
+  return ok;
+#else
+  (void)freq_hz;
+  (void)frames;
+  (void)gaps_us;
+  return false;
+#endif
+}
+
+} // namespace FunkbusRemote
+
 // =====================================================================================
 // Tiny TX state machine types
 // =====================================================================================
@@ -455,9 +554,7 @@ bool HandleExtRawTx(const String& json) {
     fb_log_preview_timings(timings, 16, "t");
     fb_log_preview_timings(gaps, 8, "gap");
 
-    // TERMINATION (no RF TX yet)
-    FB_LOG_N(F("[RAW-TX] (dummy) would send SINGLE frame now" CR));
-    return true;
+    return TxRawSingle(freq_hz, modulation.c_str(), timings, repeats, gaps);
   }
 
   // =========================
@@ -505,9 +602,7 @@ bool HandleExtRawTx(const String& json) {
     }
     fb_log_preview_timings(gaps, 8, "gap");
 
-    // TERMINATION (no RF TX yet)
-    FB_LOG_N(F("[RAW-TX] (dummy) would send PLAYLIST now" CR));
-    return true;
+    return TxRawPlaylist(freq_hz, modulation.c_str(), frames, gaps);
   }
 
   FB_LOG_E(F("[RAW-TX] ext_raw_v present but no 'timings_us' or 'frames' found" CR));

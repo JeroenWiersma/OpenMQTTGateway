@@ -751,3 +751,63 @@ void FunkbusTB::endTxSession() {
   // No explicit SIDLE here; resumeAfterTx() will do fast SIDLE→SRX and re-arm RX.
   FunkbusRx::resumeAfterTx();
 }
+
+// ============================================================================
+// Raw OOK TX session (save → configure → TX → restore)
+// ============================================================================
+
+bool FunkbusTB::rawOokBegin(RawTxSession& s, uint32_t tx_freq_hz) {
+  ensureDriverInitialized();
+  EnsureListenFreqInitialized();
+
+  // Snapshot current state
+  s.prev_freq_hz = readProgrammedFrequencyHz(FUNKBUS_CC1101_XTAL_HZ);
+  s.prev_listen_mhz = GetListenMhz();
+  s.prev_marc5 = readMarc5();
+  s.restore_freq = false;
+
+  // If a TX frequency is requested and differs, reprogram (with SCAL)
+  if (tx_freq_hz != 0 && tx_freq_hz != s.prev_freq_hz) {
+    s.restore_freq = true;
+    (void)programFrequencyHz(tx_freq_hz, FUNKBUS_CC1101_XTAL_HZ, true);
+  }
+
+  // Enter TX session using your fast path; it applies TX profile + GDO modes
+  beginTxSession();
+
+  // We expect TX (or FSTXON) here; tolerate brief settling
+  const uint8_t st5 = readMarc5();
+  if (st5 != MARC_TX && st5 != MARC_FSTXON) {
+    FB_LOG_W(F("[FunkbusTB] rawOokBegin: unexpected MARC=%s (0x%02X)" CR),
+             marcName(st5), (unsigned)st5);
+  }
+
+  // The caller (FunkbusRemote) now drives OOK on FUNKBUS_CC1101_GDO0_MCU
+  return true;
+}
+
+bool FunkbusTB::rawOokEndRestore(const RawTxSession& s) {
+  // Return to RX path and let your RX module re-arm
+  endTxSession(); // this does SIDLE→SRX via switchTxToRxFast() inside resumeAfterTx()
+
+  // If we changed the programmed frequency, restore it exactly
+  if (s.restore_freq) {
+    (void)programFrequencyHz(s.prev_freq_hz, FUNKBUS_CC1101_XTAL_HZ, true);
+  }
+
+  // Re-apply the persisted listen MHz model (your project’s “home” freq)
+  setMHz(s.prev_listen_mhz);
+
+  // If we were in RX before the TX, ensure we are back in MARC_RX
+  if (s.prev_marc5 == MARC_RX) {
+    if (!assureRxReady(40)) {
+      FB_LOG_W(F("[FunkbusTB] rawOokEndRestore: assureRxReady() failed; MARC=%s" CR),
+               marcName(readMarc5()));
+      return false;
+    }
+  } else {
+    // If we weren’t in RX, at least verify IDLE is clean
+    (void)waitMarc(MARC_IDLE, 10);
+  }
+  return true;
+}
