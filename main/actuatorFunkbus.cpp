@@ -29,7 +29,6 @@
 #  include "modules/funkbus/funkbus_log.h"
 #  include "modules/funkbus/funkbus_tx.h"
 
-
 // --- Init guard -------------------------------------------------------------
 
 /**
@@ -68,6 +67,15 @@ void XtoFunkbus(const char* topic, JsonObject& root) {
       FB_LOG_W(F("[Funkbus] Unknown/failed cmd" CR));
     }
     return;
+  }
+
+  // EXTENDED RAW TX fast-path: Transmit RAW signals that are not Funkbus related
+  if (root.containsKey("ext_raw_v")) {
+    FB_VLOG(F("[Funkbus] route=EXT_RAW_V" CR));
+    if (!FunkbusRemote::HandleExtRawTx(json)) {
+      FB_LOG_W(F("[Funkbus] Unknown/failed cmd" CR));
+    }
+    return; // do not fall through to other handlers
   }
 
   // Transmit a Funkbus telegram

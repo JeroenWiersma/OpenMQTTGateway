@@ -26,6 +26,21 @@ namespace FunkbusRemote {
 // Small JSON command dispatcher for CC1101 debug/controls
 bool HandleCc1101Command(const String& json);
 
+/**
+ * @brief Handle extended raw TX JSON command.
+ * Supports:
+ *  (A) Single frame + optional repeats/gaps:
+ *      { "ext_raw_v":1, "frequency_hz":868300000, "modulation":"OOK",
+ *        "sample_us":1, "timings_us":[ON,OFF,...], "repeats":5, "gaps_us":[...] }
+ *
+ *  (B) Playlist (multi-frame):
+ *      { "ext_raw_v":1, "frequency_hz":868300000, "modulation":"OOK",
+ *        "sample_us":1, "frames":[{"timings_us":[...]},...], "gaps_us":[...] }
+ *
+ * This function only validates & logs for now (no RF TX).
+ */
+bool HandleExtRawTx(const String& json);
+
 // Validate user JSON and map into FunkbusPayload fields
 bool ValidatePayload(const String& jsonText, FunkbusPayload* out, String* error);
 

@@ -344,6 +344,178 @@ struct TxFreqGuard {
 
 } // namespace
 
+// -----------------------------------------------------------------------------
+// Extended RAW TX (validation + logging only; no RF action yet)
+// -----------------------------------------------------------------------------
+#include <ArduinoJson.h> // local include in .cpp is safe
+
+namespace {
+
+// Read [uint32,...] into vector
+static bool fb_ReadUIntArray(JsonVariant v, std::vector<uint32_t>& out) {
+  out.clear();
+  if (!v.is<JsonArray>()) return false;
+  for (JsonVariant e : v.as<JsonArray>()) {
+    if (!e.is<uint32_t>()) return false;
+    out.push_back(e.as<uint32_t>());
+  }
+  return true;
+}
+
+// Read frames: [{ "timings_us":[...] }, ...]
+static bool fb_ReadFramesArray(JsonVariant v, std::vector<std::vector<uint32_t>>& frames) {
+  frames.clear();
+  if (!v.is<JsonArray>()) return false;
+  for (JsonVariant f : v.as<JsonArray>()) {
+    if (!f.is<JsonObject>()) return false;
+    JsonVariant t = f["timings_us"];
+    std::vector<uint32_t> one;
+    if (!fb_ReadUIntArray(t, one)) return false;
+    frames.push_back(std::move(one));
+  }
+  return true;
+}
+
+static void fb_log_preview_timings(const std::vector<uint32_t>& v, size_t maxn, const char* tag) {
+  const size_t n = std::min(v.size(), maxn);
+  for (size_t i = 0; i < n; ++i) {
+    FB_LOG_N(F("[RAW-TX]   %s[%u]=%u"), tag, (unsigned)i, (unsigned)v[i]);
+  }
+  FB_LOG_N(F(CR));
+}
+
+} // namespace
+
+namespace FunkbusRemote {
+
+bool HandleExtRawTx(const String& json) {
+  // Use a dynamic doc sized to input; add slack for keys
+  DynamicJsonDocument doc(json.length() + 1024);
+  DeserializationError err = deserializeJson(doc, json);
+  if (err) {
+    FB_LOG_E(F("[RAW-TX] JSON parse error: %s" CR), err.c_str());
+    return false;
+  }
+  JsonObject root = doc.as<JsonObject>();
+  if (!root.containsKey("ext_raw_v")) {
+    // Not for us
+    FB_VLOG(F("[RAW-TX] ext_raw_v missing (ignored)"));
+    return false;
+  }
+
+  const int extv = root["ext_raw_v"].as<int>();
+  if (extv != 1) {
+    FB_LOG_E(F("[RAW-TX] Unsupported ext_raw_v=%d" CR), extv);
+    return false;
+  }
+
+  // frequency (prefer Hz; accept MHz under 'frequency')
+  uint32_t freq_hz = 0;
+  if (root.containsKey("frequency_hz"))
+    freq_hz = root["frequency_hz"].as<uint32_t>();
+  else if (root.containsKey("freq_hz"))
+    freq_hz = root["freq_hz"].as<uint32_t>();
+  else if (root.containsKey("frequency"))
+    freq_hz = (uint32_t)(root["frequency"].as<float>() * 1000000.0f);
+
+  String modulation;
+  if (root.containsKey("modulation")) modulation = root["modulation"].as<const char*>();
+
+  // =========================
+  // (A) Single-frame variant
+  // =========================
+  if (root.containsKey("timings_us")) {
+    std::vector<uint32_t> timings, gaps;
+    if (!fb_ReadUIntArray(root["timings_us"], timings)) {
+      FB_LOG_E(F("[RAW-TX] timings_us must be an array of uint32" CR));
+      return false;
+    }
+    if (timings.size() < 2 || (timings.size() & 1) != 0) {
+      FB_LOG_E(F("[RAW-TX] timings_us must be EVEN length (ON,OFF,...) and >=2" CR));
+      return false;
+    }
+    uint32_t repeats = 1;
+    if (root.containsKey("repeats")) repeats = root["repeats"].as<uint32_t>();
+    if (root.containsKey("gaps_us")) {
+      if (!fb_ReadUIntArray(root["gaps_us"], gaps)) {
+        FB_LOG_E(F("[RAW-TX] gaps_us must be an array of uint32" CR));
+        return false;
+      }
+      if (repeats > 1 && !gaps.empty() && gaps.size() < (repeats - 1)) {
+        FB_LOG_W(F("[RAW-TX] gaps_us shorter than repeats-1; remaining gaps will reuse last value" CR));
+      }
+    }
+
+    FB_LOG_N(F("[RAW-TX] SINGLE  freq=%u Hz, modulation=%s, repeats=%u, timings=%u, gaps=%u" CR),
+             (unsigned)freq_hz,
+             modulation.length() ? modulation.c_str() : "n/a",
+             (unsigned)repeats,
+             (unsigned)timings.size(),
+             (unsigned)gaps.size());
+    fb_log_preview_timings(timings, 16, "t");
+    fb_log_preview_timings(gaps, 8, "gap");
+
+    // TERMINATION (no RF TX yet)
+    FB_LOG_N(F("[RAW-TX] (dummy) would send SINGLE frame now" CR));
+    return true;
+  }
+
+  // =========================
+  // (B) Playlist variant
+  // =========================
+  if (root.containsKey("frames")) {
+    std::vector<std::vector<uint32_t>> frames;
+    if (!fb_ReadFramesArray(root["frames"], frames)) {
+      FB_LOG_E(F("[RAW-TX] frames must be an array of objects each having timings_us[]" CR));
+      return false;
+    }
+    if (frames.empty()) {
+      FB_LOG_E(F("[RAW-TX] frames[] is empty" CR));
+      return false;
+    }
+    // Validate each frame
+    for (size_t i = 0; i < frames.size(); ++i) {
+      const auto& t = frames[i];
+      if (t.size() < 2 || (t.size() & 1) != 0) {
+        FB_LOG_E(F("[RAW-TX] frame[%u] timings_us must be EVEN length (ON,OFF,...) and >=2" CR), (unsigned)i);
+        return false;
+      }
+    }
+
+    std::vector<uint32_t> gaps;
+    if (root.containsKey("gaps_us")) {
+      if (!fb_ReadUIntArray(root["gaps_us"], gaps)) {
+        FB_LOG_E(F("[RAW-TX] gaps_us must be an array of uint32" CR));
+        return false;
+      }
+      if (!gaps.empty() && gaps.size() < (frames.size() - 1)) {
+        FB_LOG_W(F("[RAW-TX] gaps_us shorter than frames-1; remaining inter-frame gaps will reuse last value" CR));
+      }
+    }
+
+    FB_LOG_N(F("[RAW-TX] PLAYLIST  freq=%u Hz, modulation=%s, frames=%u, gaps=%u" CR),
+             (unsigned)freq_hz,
+             modulation.length() ? modulation.c_str() : "n/a",
+             (unsigned)frames.size(),
+             (unsigned)gaps.size());
+    for (size_t fi = 0; fi < frames.size(); ++fi) {
+      FB_LOG_N(F("[RAW-TX]   frame[%u] timings=%u%s"),
+               (unsigned)fi, (unsigned)frames[fi].size(), frames[fi].empty() ? " (EMPTY!)" : "" CR);
+      fb_log_preview_timings(frames[fi], 12, "t");
+    }
+    fb_log_preview_timings(gaps, 8, "gap");
+
+    // TERMINATION (no RF TX yet)
+    FB_LOG_N(F("[RAW-TX] (dummy) would send PLAYLIST now" CR));
+    return true;
+  }
+
+  FB_LOG_E(F("[RAW-TX] ext_raw_v present but no 'timings_us' or 'frames' found" CR));
+  return false;
+}
+
+} // namespace FunkbusRemote
+
 // =====================================================================================
 // Validation & mapping helpers
 // =====================================================================================
