@@ -1026,7 +1026,7 @@ void FunkbusRx::pauseForTx() {
 void FunkbusRx::resumeAfterTx() {
   using namespace FunkbusTB;
 
-  FunkbusTB::setMHz(FunkbusTB::GetListenMhz()); // usually a no-op
+  FunkbusTB::setMHz(FunkbusTB::GetPersistedMhz());
 
   // Fast hop TX->RX; NO extra waits around this.
   if (!FunkbusTB::switchTxToRxFast(20)) {

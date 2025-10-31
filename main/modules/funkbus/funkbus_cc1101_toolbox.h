@@ -162,6 +162,8 @@ void SetListenMhz(float mhz);
 // Role: Get current ensured listen-MHz value (reads radio on first use in NEW model).
 float GetListenMhz();
 
+float GetPersistedMhz();
+
 // Role: Get current RSSI Db value.
 int ReadRssiDbm();
 // endregion

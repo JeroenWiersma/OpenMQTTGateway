@@ -426,7 +426,7 @@ struct TxFreqGuard {
   float prev = NAN;
   explicit TxFreqGuard(float tx_mhz) {
 #ifdef ZradioCC1101
-    prev = FunkbusTB::GetListenMhz();
+    prev = FunkbusTB::GetPersistedMhz(); // persisted target from NVS
     FunkbusTB::setMHz(tx_mhz);
     DUMP_REGS();
 #endif

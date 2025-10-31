@@ -95,6 +95,24 @@ inline constexpr uint8_t IOCFG0_HIZ = 0x2E;
 inline constexpr uint32_t WAIT_TX_READY_MS = 1;
 } // namespace cc1101
 
+// We don't have a commonRF.h. RFConfig is defined in commonRF.cpp and
+// the struct is also declared in webUI.cpp. Re-declare the same layout here
+// and extern the instance to read the persisted frequency.
+extern struct RFConfig_s {
+  float frequency;
+  int rssiThreshold;
+  int newOokThreshold;
+  int activeReceiver;
+} RFConfig;
+
+namespace FunkbusTB {
+float GetPersistedMhz() {
+  return RFConfig.frequency; // value is loaded from NVS at boot and updated by /rf Save
+}
+
+// …rest of existing FunkbusTB implementation…
+} // namespace FunkbusTB
+
 // ----------------------------------------------------------------------------
 // SPI helpers
 // ----------------------------------------------------------------------------
