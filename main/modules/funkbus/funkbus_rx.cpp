@@ -79,7 +79,7 @@ inline constexpr uint32_t kCsMinOnMs = 12; // Min ON window to consider a valid 
 inline constexpr uint32_t kCsMinLowMs = 8; // Min time CS must stay LOW before re-arming (ms)
 
 // RX worker task sizing/affinity (internal/private)
-inline constexpr uint32_t kRxWorkerStack = 4096; // RX worker task stack size (bytes)
+inline constexpr uint32_t kRxWorkerStack = 8192; // RX worker task stack size (bytes)
 inline constexpr UBaseType_t kRxWorkerPrio = configMAX_PRIORITIES - 2; // RX worker priority
 #if defined(ARDUINO_RUNNING_CORE)
 inline constexpr BaseType_t kRxWorkerCore = ARDUINO_RUNNING_CORE; // Pin worker to same core as Arduino

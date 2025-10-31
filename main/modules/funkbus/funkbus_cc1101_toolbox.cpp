@@ -268,7 +268,42 @@ void FunkbusTB::setMHz(float mhz) {
   if (s_has_current_mhz && same_mhz(mhz, s_current_mhz)) {
     return;
   }
+
+  // Decide whether to force SCAL after re-tuning
+  auto band_bucket = [](float fmhz) -> int {
+    // CC1101 valid bands: 300–348, 387–464, 779–928 MHz
+    // Bucket them broadly as 315 / 433 / 868 groups
+    if (fmhz < 380.0f) return 315; // 300–348 (and any 315-ish values)
+    if (fmhz < 700.0f) return 433; // 387–464
+    return 868; // 779–928
+  };
+
+  const bool have_prev = s_has_current_mhz;
+  const float prev_mhz = s_current_mhz;
+  bool big_hop = false;
+
+  if (have_prev) {
+    const float df = fabsf(mhz - prev_mhz);
+    const bool crossed_bucket = band_bucket(mhz) != band_bucket(prev_mhz);
+    big_hop = (df >= 20.0f) || crossed_bucket;
+  }
+
+  // Program the synthesizer (writes FREQ2/1/0 + internal driver handling)
   ELECHOUSE_cc1101.setMHZ(mhz);
+
+  // On large hops or band changes, explicitly calibrate the PLL
+  if (big_hop) {
+    // Go idle first to ensure SCAL is accepted reliably
+    st(cc1101::SIDLE);
+    (void)waitMarc(MARC_IDLE, 2); // tiny settle; units = ms in your helpers
+
+    st(cc1101::SCAL);
+    (void)waitMarc(MARC_IDLE, 8); // wait until calibration completes
+
+#if FUNK_LOG_INFO
+    FB_LOG_N(F("[FunkbusTB] Big hop: SCAL after %.2f -> %.2f MHz" CR), prev_mhz, mhz);
+#endif
+  }
 
   // Update cache
   s_current_mhz = mhz;
