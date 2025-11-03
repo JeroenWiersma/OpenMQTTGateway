@@ -210,6 +210,76 @@ private:
 
 } // namespace
 
+// =====================================================================================
+// RMT/segment helpers & TX  — placed BEFORE RAW functions to satisfy ordering
+// =====================================================================================
+struct Seg {
+  uint8_t level;
+  uint16_t us;
+};
+
+// pushSeg — coalesce adjacent same-level segments and cap duration to 16-bit
+static inline void pushSeg(std::vector<Seg>& segs, uint8_t level, uint32_t dur) {
+  if (!dur) return;
+  if (!segs.empty() && segs.back().level == level) {
+    uint32_t sum = (uint32_t)segs.back().us + dur;
+    segs.back().us = (uint16_t)std::min<uint32_t>(sum, 0xFFFF);
+  } else {
+    segs.push_back(Seg{level, (uint16_t)std::min<uint32_t>(dur, 0xFFFF)});
+  }
+}
+
+// Build RAW (ON/OFF, µs) into Segs, chunking long durations to avoid 15-bit RMT caps
+static inline void addSegChunked(std::vector<Seg>& out, uint8_t level, uint32_t us) {
+  // Keep individual segments <= 30000 µs so both Seg.us (uint16_t) and RMT half-item limits are safe
+  while (us) {
+    uint16_t piece = (uint16_t)std::min<uint32_t>(us, 30000);
+    pushSeg(out, level, piece);
+    us -= piece;
+  }
+}
+
+static void buildRawSegs_FromOnOffTimings(const std::vector<uint32_t>& timings_us,
+                                          std::vector<Seg>& segs_out,
+                                          bool ensure_trailing_low = true) {
+  segs_out.clear();
+  uint8_t level = 1; // RAW starts with ON=HIGH
+  for (uint32_t d : timings_us) {
+    addSegChunked(segs_out, level, d);
+    level ^= 1;
+  }
+  if (ensure_trailing_low) {
+    // make sure line idles LOW between repeats/frames
+    addSegChunked(segs_out, 0, 1);
+  }
+}
+
+// SegsToRmt — convert compact (level,µs) segments to rmt_item32_t
+static void SegsToRmt(const std::vector<Seg>& segs, uint32_t clk_hz, std::vector<rmt_item32_t>& out) {
+  if (!clk_hz) clk_hz = RMT_TICKS_PER_SEC;
+  auto us_to_ticks = [clk_hz](uint32_t us) -> uint32_t {
+    uint64_t num = (uint64_t)us * (uint64_t)clk_hz + RMT_ROUNDING_HALF;
+    uint32_t t = (uint32_t)(num / 1000000ULL);
+    return (t > RMT_DURATION_MAX_TICKS ? RMT_DURATION_MAX_TICKS : t);
+  };
+  out.clear();
+  out.reserve((segs.size() + 1) / 2);
+  for (size_t i = 0; i < segs.size();) {
+    rmt_item32_t it{};
+    it.level0 = segs[i].level;
+    it.duration0 = us_to_ticks(segs[i].us);
+    if (++i < segs.size()) {
+      it.level1 = segs[i].level;
+      it.duration1 = us_to_ticks(segs[i].us);
+      ++i;
+    } else {
+      it.level1 = 0;
+      it.duration1 = 0;
+    }
+    out.push_back(it);
+  }
+}
+
 #if FUNKBUS_LED_TX_ENABLE
 static inline void tx_led_write(bool on) {
   digitalWrite(FUNKBUS_LED_TX_GPIO,
@@ -258,7 +328,48 @@ bool TxRawSingle(uint32_t freq_hz,
     return false;
   }
 
-  // Send repeats, holding LOW for a gap between repeats (if provided)
+#  if FUNKBUS_LED_TX_ENABLE
+  TxLedGuard _tx_led_on;
+#  endif
+
+  // Try RMT first (reusing the existing session wrapper & converters)
+  {
+    RmtTxSession txMain(
+        kRmtTxChannel,
+        static_cast<gpio_num_t>(FUNKBUS_CC1101_GDO0_MCU),
+        kRmtClkDiv);
+
+    if (txMain.begin()) {
+      const uint32_t clk_main_hz = txMain.counter_hz();
+
+      std::vector<Seg> segs;
+      segs.reserve(timings_us.size() + 8);
+
+      // Build all repeats + inter-repeat gaps into one contiguous segment list
+      for (uint32_t i = 0; i < repeats; ++i) {
+        buildRawSegs_FromOnOffTimings(timings_us, segs, /*ensure_trailing_low=*/true);
+        if (i + 1 < repeats) {
+          uint32_t gap = gaps_us.empty() ? 0U : (i < gaps_us.size() ? gaps_us[i] : gaps_us.back());
+          if (gap) addSegChunked(segs, 0, gap);
+        }
+      }
+
+      // Convert and write in one shot
+      std::vector<rmt_item32_t> items;
+      SegsToRmt(segs, clk_main_hz, items);
+      const bool ok = txMain.write(items);
+
+      txMain.end();
+      pinMode(FUNKBUS_CC1101_GDO0_MCU, OUTPUT);
+      digitalWrite(FUNKBUS_CC1101_GDO0_MCU, LOW);
+
+      const bool restored = FunkbusTB::rawOokEndRestore(sess);
+      if (!restored) FB_LOG_W(F("[RAW-TX] restore reported issues" CR));
+      return ok && restored;
+    }
+  }
+
+  // Fallback: original GPIO-timed path (unchanged)
   for (uint32_t i = 0; i < repeats; ++i) {
     if (!SendOnOffTimingsGPIO(timings_us)) {
       FB_LOG_E(F("[RAW-TX] GPIO send failed at repeat %u" CR), (unsigned)i);
@@ -297,6 +408,48 @@ bool TxRawPlaylist(uint32_t freq_hz,
     return false;
   }
 
+#  if FUNKBUS_LED_TX_ENABLE
+  TxLedGuard _tx_led_on;
+#  endif
+
+  {
+    RmtTxSession txMain(
+        kRmtTxChannel,
+        static_cast<gpio_num_t>(FUNKBUS_CC1101_GDO0_MCU),
+        kRmtClkDiv);
+
+    if (txMain.begin()) {
+      const uint32_t clk_main_hz = txMain.counter_hz();
+
+      std::vector<Seg> segs;
+      // Pre-size generously to avoid reallocs
+      size_t est = 0;
+      for (const auto& f : frames) est += f.size();
+      segs.reserve(est + frames.size() * 4);
+
+      for (size_t i = 0; i < frames.size(); ++i) {
+        buildRawSegs_FromOnOffTimings(frames[i], segs, /*ensure_trailing_low=*/true);
+        if (i + 1 < frames.size()) {
+          uint32_t gap = gaps_us.empty() ? 0U : (i < gaps_us.size() ? gaps_us[i] : gaps_us.back());
+          if (gap) addSegChunked(segs, 0, gap);
+        }
+      }
+
+      std::vector<rmt_item32_t> items;
+      SegsToRmt(segs, clk_main_hz, items);
+      const bool ok = txMain.write(items);
+
+      txMain.end();
+      pinMode(FUNKBUS_CC1101_GDO0_MCU, OUTPUT);
+      digitalWrite(FUNKBUS_CC1101_GDO0_MCU, LOW);
+
+      const bool restored = FunkbusTB::rawOokEndRestore(sess);
+      if (!restored) FB_LOG_W(F("[RAW-TX] restore reported issues" CR));
+      return ok && restored;
+    }
+  }
+
+  // Fallback GPIO (existing behavior)
   for (size_t i = 0; i < frames.size(); ++i) {
     if (!SendOnOffTimingsGPIO(frames[i])) {
       FB_LOG_E(F("[RAW-TX] GPIO send failed at frame %u" CR), (unsigned)i);
@@ -972,51 +1125,6 @@ bool Build48BitFrame_buf(const char first40[FIRST40_STRLEN], uint8_t frameSerial
 }
 
 } // namespace FunkbusRemote
-
-// =====================================================================================
-// RMT/segment helpers & TX
-// =====================================================================================
-struct Seg {
-  uint8_t level;
-  uint16_t us;
-};
-
-// SegsToRmt — convert compact (level,µs) segments to rmt_item32_t">
-static void SegsToRmt(const std::vector<Seg>& segs, uint32_t clk_hz, std::vector<rmt_item32_t>& out) {
-  if (!clk_hz) clk_hz = RMT_TICKS_PER_SEC;
-  auto us_to_ticks = [clk_hz](uint32_t us) -> uint32_t {
-    uint64_t num = (uint64_t)us * (uint64_t)clk_hz + RMT_ROUNDING_HALF;
-    uint32_t t = (uint32_t)(num / 1000000ULL);
-    return (t > RMT_DURATION_MAX_TICKS ? RMT_DURATION_MAX_TICKS : t);
-  };
-  out.clear();
-  out.reserve((segs.size() + 1) / 2);
-  for (size_t i = 0; i < segs.size();) {
-    rmt_item32_t it{};
-    it.level0 = segs[i].level;
-    it.duration0 = us_to_ticks(segs[i].us);
-    if (++i < segs.size()) {
-      it.level1 = segs[i].level;
-      it.duration1 = us_to_ticks(segs[i].us);
-      ++i;
-    } else {
-      it.level1 = 0;
-      it.duration1 = 0;
-    }
-    out.push_back(it);
-  }
-}
-
-// pushSeg — coalesce adjacent same-level segments and cap duration to 16-bit">
-static inline void pushSeg(std::vector<Seg>& segs, uint8_t level, uint32_t dur) {
-  if (!dur) return;
-  if (!segs.empty() && segs.back().level == level) {
-    uint32_t sum = (uint32_t)segs.back().us + dur;
-    segs.back().us = (uint16_t)std::min<uint32_t>(sum, 0xFFFF);
-  } else {
-    segs.push_back(Seg{level, (uint16_t)std::min<uint32_t>(dur, 0xFFFF)});
-  }
-}
 
 namespace {
 // SendFramesWithStateMachine48 — schedule & transmit four 48-bit frames with precise per-channel gaps">
