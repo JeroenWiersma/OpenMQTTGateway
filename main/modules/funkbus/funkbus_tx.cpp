@@ -179,6 +179,18 @@ public:
     return rmt_wait_tx_done(ch_, portMAX_DELAY) == ESP_OK;
   }
 
+  bool write_chunked(const std::vector<rmt_item32_t>& items, size_t chunk = 60) {
+    if (!installed_ || items.empty()) return false;
+    size_t i = 0;
+    while (i < items.size()) {
+      size_t n = std::min(chunk, items.size() - i);
+      if (rmt_write_items(ch_, &items[i], n, false) != ESP_OK) return false;
+      if (rmt_wait_tx_done(ch_, portMAX_DELAY) != ESP_OK) return false;
+      i += n;
+    }
+    return true;
+  }
+
   void stop() {
     if (!installed_) return;
     (void)rmt_tx_stop(ch_);
@@ -232,9 +244,11 @@ static inline void pushSeg(std::vector<Seg>& segs, uint8_t level, uint32_t dur) 
 // Build RAW (ON/OFF, µs) into Segs, chunking long durations to avoid 15-bit RMT caps
 static inline void addSegChunked(std::vector<Seg>& out, uint8_t level, uint32_t us) {
   // Keep individual segments <= 30000 µs so both Seg.us (uint16_t) and RMT half-item limits are safe
+  const uint32_t max_chunk = 30000;
   while (us) {
-    uint16_t piece = (uint16_t)std::min<uint32_t>(us, 30000);
-    pushSeg(out, level, piece);
+    uint16_t piece = (uint16_t)std::min<uint32_t>(us, max_chunk);
+    // pushSeg(out, level, piece);
+    out.push_back(Seg{level, piece});
     us -= piece;
   }
 }
@@ -242,7 +256,6 @@ static inline void addSegChunked(std::vector<Seg>& out, uint8_t level, uint32_t 
 static void buildRawSegs_FromOnOffTimings(const std::vector<uint32_t>& timings_us,
                                           std::vector<Seg>& segs_out,
                                           bool ensure_trailing_low = true) {
-  segs_out.clear();
   uint8_t level = 1; // RAW starts with ON=HIGH
   for (uint32_t d : timings_us) {
     addSegChunked(segs_out, level, d);
@@ -343,7 +356,8 @@ bool TxRawSingle(uint32_t freq_hz,
       const uint32_t clk_main_hz = txMain.counter_hz();
 
       std::vector<Seg> segs;
-      segs.reserve(timings_us.size() + 8);
+      segs.clear();
+      segs.reserve(timings_us.size() * repeats + 8);
 
       // Build all repeats + inter-repeat gaps into one contiguous segment list
       for (uint32_t i = 0; i < repeats; ++i) {
@@ -357,7 +371,9 @@ bool TxRawSingle(uint32_t freq_hz,
       // Convert and write in one shot
       std::vector<rmt_item32_t> items;
       SegsToRmt(segs, clk_main_hz, items);
-      const bool ok = txMain.write(items);
+      FB_VLOG(F("[RAW-TX] items=%u segs=%u clk=%uHz" CR),
+              (unsigned)items.size(), (unsigned)segs.size(), (unsigned)clk_main_hz);
+      const bool ok = txMain.write_chunked(items, 60);
 
       txMain.end();
       pinMode(FUNKBUS_CC1101_GDO0_MCU, OUTPUT);
@@ -422,6 +438,7 @@ bool TxRawPlaylist(uint32_t freq_hz,
       const uint32_t clk_main_hz = txMain.counter_hz();
 
       std::vector<Seg> segs;
+      segs.clear();
       // Pre-size generously to avoid reallocs
       size_t est = 0;
       for (const auto& f : frames) est += f.size();
@@ -437,7 +454,9 @@ bool TxRawPlaylist(uint32_t freq_hz,
 
       std::vector<rmt_item32_t> items;
       SegsToRmt(segs, clk_main_hz, items);
-      const bool ok = txMain.write(items);
+      FB_VLOG(F("[RAW-TX] items=%u segs=%u clk=%uHz" CR),
+              (unsigned)items.size(), (unsigned)segs.size(), (unsigned)clk_main_hz);
+      const bool ok = txMain.write_chunked(items, 60);
 
       txMain.end();
       pinMode(FUNKBUS_CC1101_GDO0_MCU, OUTPUT);
