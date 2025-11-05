@@ -1,3 +1,18 @@
+//
+// OpenMQTTGateway — Funkbus TX (ESP32/RMT)
+//
+// Builds Funkbus 48-bit frames and transmits them via CC1101 GDO0 using the
+// ESP32 RMT peripheral (with a GPIO fallback). Also exposes an extended raw TX
+// path for ON/OFF microsecond timings and a tiny CC1101 debug command set.
+//
+// Notes:
+// - TX uses a short RAII guard to hop to FUNKBUS_TX_MHZ and restore listen MHz.
+// - RMT path is preferred; GPIO path remains as a compatibility fallback.
+// - Keep constants small and close to users; heavy logic lives in helpers.
+//
+// License: MIT
+//
+
 #include "funkbus_tx.h"
 
 #include <algorithm>
@@ -20,126 +35,114 @@
 #endif
 
 // ============================================================================
-// TU-LOCAL CONSTANTS (constexpr) — protocol geometry, sizes, indices
+// 1) Protocol geometry & user-facing constants (constexpr)
 // ============================================================================
 namespace {
 
-// --- Bit geometry -----------------------------------------------------------
-constexpr int FRAME_BITS = 48; // Total bits in a Funkbus frame
-constexpr int FIRST40_BITS = 40; // Bits in the “first40” payload section
-constexpr int PARITY_RANGE_BITS = 43; // Bits covered by parity (first40 + SCOM)
-constexpr int SCOM_START_BIT = 40; // Bit index where 3-bit SCOM begins
-constexpr int SCOM_MAX = 7; // Highest valid SCOM value (0..7)
+// ---- Bit geometry -----------------------------------------------------------
+constexpr int FRAME_BITS = 48; // Funkbus frame total bits
+constexpr int FIRST40_BITS = 40; // "first40" payload bits
+constexpr int PARITY_RANGE_BITS = 43; // parity over first40 + SCOM
+constexpr int SCOM_START_BIT = 40; // 3-bit SCOM starts here
+constexpr int SCOM_MAX = 7; // 0..7
 
-// --- String buffer lengths (NUL-terminated) --------------------------------
-constexpr int FRAME_STRLEN = FRAME_BITS + 1; // 48-bit string + NUL
-constexpr int FIRST40_STRLEN = FIRST40_BITS + 1; // 40-bit string + NUL
+// ---- String buffer sizes (NUL-terminated) ----------------------------------
+constexpr int FRAME_STRLEN = FRAME_BITS + 1;
+constexpr int FIRST40_STRLEN = FIRST40_BITS + 1;
 static_assert(SCOM_START_BIT + 3 <= FRAME_BITS, "SCOM overflow");
 
-// --- Field sizes & validation helpers --------------------------------------
-constexpr int SERIAL_HEX_LEN = 5; // Serial printed as 5 hex chars
-constexpr int SERIAL_BITS = 20; // Serial is 20 bits
-constexpr int BUTTON_MIN = 1; // Smallest valid button id
-constexpr int BUTTON_MAX = 8; // Largest valid button id
+// ---- Field sizes & validation helpers --------------------------------------
+constexpr int SERIAL_HEX_LEN = 5; // 5 hex chars -> 20 bits
+constexpr int SERIAL_BITS = 20;
+constexpr int BUTTON_MIN = 1;
+constexpr int BUTTON_MAX = 8;
 
 } // namespace
 
 // ============================================================================
-// FIXED BIT FIELDS (string literals) — observed constant fields in first40
-// (migrated to constexpr char[]; not intended for build-time overrides)
+// 2) Fixed “first40” fields (observed values) — constexpr char[]
 // ============================================================================
-inline constexpr char FUNKBUS_RC_TYPE[] = "0010"; // Device type (observed)
-inline constexpr char FUNKBUS_RC_SUBTYPE[] = "1100"; // Device subtype (observed)
-inline constexpr char FUNKBUS_UNKNOWN_29_30[] = "00"; // Bits 29..30 (reserved/unknown)
-inline constexpr char FUNKBUS_BATTERY_OK[] = "0"; // Bit 31: 0 = battery OK
-inline constexpr char FUNKBUS_UNKNOWN_32_33[] = "00"; // Bits 32..33 (reserved/unknown)
-inline constexpr char FUNKBUS_UNKNOWN_39[] = "0"; // Bit 39  (reserved/unknown)
+inline constexpr char FUNKBUS_RC_TYPE[] = "0010";
+inline constexpr char FUNKBUS_RC_SUBTYPE[] = "1100";
+inline constexpr char FUNKBUS_UNKNOWN_29_30[] = "00";
+inline constexpr char FUNKBUS_BATTERY_OK[] = "0"; // 0 = OK
+inline constexpr char FUNKBUS_UNKNOWN_32_33[] = "00";
+inline constexpr char FUNKBUS_UNKNOWN_39[] = "0";
 
 // ============================================================================
-// CHANNEL / ACTION MAPS — symbolic 2-bit channels + 1-bit action
-// (migrated to constexpr char[])
+// 3) Channel/action maps (symbolic bit strings) — constexpr char[]
 // ============================================================================
-inline constexpr char FUNKBUS_CH_A[] = "00"; // Channel A
-inline constexpr char FUNKBUS_CH_B[] = "10"; // Channel B
-inline constexpr char FUNKBUS_CH_C[] = "01"; // Channel C
-inline constexpr char FUNKBUS_CH_LS[] = "11"; // Channel LS (group)
-inline constexpr char FUNKBUS_ACT_ON[] = "1"; // Action ON
-inline constexpr char FUNKBUS_ACT_OFF[] = "0"; // Action OFF
+inline constexpr char FUNKBUS_CH_A[] = "00";
+inline constexpr char FUNKBUS_CH_B[] = "10";
+inline constexpr char FUNKBUS_CH_C[] = "01";
+inline constexpr char FUNKBUS_CH_LS[] = "11";
+inline constexpr char FUNKBUS_ACT_ON[] = "1";
+inline constexpr char FUNKBUS_ACT_OFF[] = "0";
 
 // ============================================================================
-// TX/RADIO TIMING — preamble, bit cell, trailer, inter-frame gap
-// (Public knobs remain macros to allow build-time overrides.)
+// 4) TX timing (µs) — macros remain overridable via build flags
 // ============================================================================
-#define FUNKBUS_HALF_BIT_US         500 // Half of a Manchester bit cell (µs)
-#define FUNKBUS_PREAMBLE_LEADIN_US  3900 // High “leader” pulse (µs)
-#define FUNKBUS_PREAMBLE_LEADOUT_US 100 // Low “leadout” before data (µs)
-#define FUNKBUS_INTERFRAME_GAP_US   100000 // Gap between frames in a burst (µs)
-
-// Trailer after final bit (kept as macro for overrides)
-#define FUNKBUS_TX_TRAILER_US 800 // Low time at end of frame/burst (µs)
+#define FUNKBUS_HALF_BIT_US         500
+#define FUNKBUS_PREAMBLE_LEADIN_US  3900
+#define FUNKBUS_PREAMBLE_LEADOUT_US 100
+#define FUNKBUS_INTERFRAME_GAP_US   100000
+#define FUNKBUS_TX_TRAILER_US       800
 
 // ============================================================================
-// TX SEQUENCING / HOUSEKEEPING — frame count, preroll, cooperative waits
-// (these are internal runtime constants → constexpr)
+// 5) TX sequencing & small runtime knobs (constexpr)
 // ============================================================================
-inline constexpr int FUNKBUS_TX_FRAMES_PER_BURST = 4; // Frames per single command burst
-inline constexpr uint16_t FUNKBUS_TX_PREROLL_US = 10; // Stabilization low before preamble (µs)
-
-inline constexpr uint32_t FUNKBUS_WAIT_YIELD_US = 1000; // Yield if wait > this (µs)
-inline constexpr uint32_t FUNKBUS_WAIT_COARSE_SLEEP_US = 500; // Coarse sleep chunk for busy waits (µs)
+inline constexpr int FUNKBUS_TX_FRAMES_PER_BURST = 4;
+inline constexpr uint16_t FUNKBUS_TX_PREROLL_US = 10;
+inline constexpr uint32_t FUNKBUS_WAIT_YIELD_US = 1000;
+inline constexpr uint32_t FUNKBUS_WAIT_COARSE_SLEEP_US = 500;
 
 // ============================================================================
-// JSON / DEBUG DEFAULTS — small result acks and carrier test
-// (migrated to constexpr)
+// 6) JSON/debug defaults (constexpr)
 // ============================================================================
-inline constexpr size_t FUNKBUS_JSON_RESERVE_TX = 512; // Reserve when serializing small TX JSON
-inline constexpr uint32_t FUNKBUS_DEFAULT_CARRIER_MS = 100; // Default ms for Debug_TxCarrierMs()
+inline constexpr size_t FUNKBUS_JSON_RESERVE_TX = 512;
+inline constexpr uint32_t FUNKBUS_DEFAULT_CARRIER_MS = 100;
 
 // ============================================================================
-// CC1101 REGISTER MAP GEOMETRY — counts/ranges for dumps (migrated to constexpr)
+// 7) CC1101 register geometry (constexpr) — for dumps
 // ============================================================================
-inline constexpr uint8_t CC1101_NUM_CONFIG_REGS = 0x2F; // Config regs 0x00..0x2E (47)
-inline constexpr uint8_t CC1101_FIRST_STATUS_ADDR = 0x30; // First status register address
-inline constexpr uint8_t CC1101_LAST_STATUS_ADDR = 0x3B; // Last  status register address
-inline constexpr uint8_t CC1101_NUM_STATUS_REGS = (CC1101_LAST_STATUS_ADDR - CC1101_FIRST_STATUS_ADDR + 1); // Derived count
-inline constexpr uint8_t CC1101_PATABLE_SIZE = 8; // PA table entries
-inline constexpr uint8_t CC1101_HEXBUF_LEN = 6; // “0xNN” with NUL (snprintf helper)
+inline constexpr uint8_t CC1101_NUM_CONFIG_REGS = 0x2F;
+inline constexpr uint8_t CC1101_FIRST_STATUS_ADDR = 0x30;
+inline constexpr uint8_t CC1101_LAST_STATUS_ADDR = 0x3B;
+inline constexpr uint8_t CC1101_NUM_STATUS_REGS = (CC1101_LAST_STATUS_ADDR - CC1101_FIRST_STATUS_ADDR + 1);
+inline constexpr uint8_t CC1101_PATABLE_SIZE = 8;
+inline constexpr uint8_t CC1101_HEXBUF_LEN = 6;
 
 // ============================================================================
-// RMT (ESP32) CONVERSION HELPERS — µs ↔ ticks and hardware limits (migrated)
+// 8) RMT conversion helpers — ticks & bounds (constexpr)
 // ============================================================================
-inline constexpr uint32_t RMT_TICKS_PER_SEC = 1000000UL; // Fallback ticks/sec when clock not queried
-inline constexpr uint32_t RMT_ROUNDING_HALF = 500000UL; // For integer rounding in tick conversion
-inline constexpr uint16_t RMT_DURATION_MAX_TICKS = 32767U; // Max per-half-item duration (15-bit field)
+inline constexpr uint32_t RMT_TICKS_PER_SEC = 1000000UL;
+inline constexpr uint32_t RMT_ROUNDING_HALF = 500000UL;
+inline constexpr uint16_t RMT_DURATION_MAX_TICKS = 32767U;
 
 // ============================================================================
-// API / TOPICS / PINS — compile-time defaults (overridable in config)
-// (keep macros to preserve #ifndef override behavior)
+// 9) API topics & pins — keep as macros for #ifndef overrides
 // ============================================================================
 #ifndef FUNKBUS_CMD_RESULT_TOPIC
-#  define FUNKBUS_CMD_RESULT_TOPIC "/FunkbustoMQTT" // Topic for small command acks/results
+#  define FUNKBUS_CMD_RESULT_TOPIC "/FunkbustoMQTT"
 #endif
 
 #ifndef FUNKBUS_CC1101_GDO0_MCU
-#  define FUNKBUS_CC1101_GDO0_MCU 12 // Default MCU GPIO wired to CC1101 GDO0 (OOK TX)
+#  define FUNKBUS_CC1101_GDO0_MCU 12
 #endif
-
-// Keep alias even if already defined elsewhere (no change intended)
-#define FUNKBUS_TX_GPIO FUNKBUS_CC1101_GDO0_MCU // Alias used by GPIO-timed path
+#define FUNKBUS_TX_GPIO FUNKBUS_CC1101_GDO0_MCU
 
 #ifndef FUNKBUS_DEFAULT_LISTEN_MHZ
-#  define FUNKBUS_DEFAULT_LISTEN_MHZ 433.42f // Default RX listen frequency (MHz)
+#  define FUNKBUS_DEFAULT_LISTEN_MHZ 433.42f
 #endif
 
-// Debug: initial segment dump toggle (kept as macro to match existing usage)
-#define FUNKBUS_TX_DUMP_FIRST_SEGS 0 // Non-zero to dump first TX segments
+#define FUNKBUS_TX_DUMP_FIRST_SEGS 0
 
 // ============================================================================
-// ESP32 RMT DEFAULTS (constexpr) — channel/divider used for TX
+// 10) RMT defaults & session RAII (TU-local)
 // ============================================================================
-namespace { // TU-local only
-inline constexpr rmt_channel_t kRmtTxChannel = RMT_CHANNEL_7; // Primary RMT TX channel
-inline constexpr uint8_t kRmtClkDiv = 80; // APB/80 → 1 MHz RMT tick
+namespace {
+inline constexpr rmt_channel_t kRmtTxChannel = RMT_CHANNEL_7;
+inline constexpr uint8_t kRmtClkDiv = 80; // APB/80 => 1 MHz
 
 class RmtTxSession {
 public:
@@ -153,7 +156,6 @@ public:
 
   bool begin() {
     if (installed_) return true;
-
     rmt_config_t cfg = {};
     cfg.rmt_mode = RMT_MODE_TX;
     cfg.channel = ch_;
@@ -194,7 +196,6 @@ public:
   void stop() {
     if (!installed_) return;
     (void)rmt_tx_stop(ch_);
-    // line stays LOW (idle level) while installed
   }
 
   void end() {
@@ -222,15 +223,14 @@ private:
 
 } // namespace
 
-// =====================================================================================
-// RMT/segment helpers & TX  — placed BEFORE RAW functions to satisfy ordering
-// =====================================================================================
+// ============================================================================
+// 11) Segment model & RMT conversion
+// ============================================================================
 struct Seg {
   uint8_t level;
   uint16_t us;
 };
 
-// pushSeg — coalesce adjacent same-level segments and cap duration to 16-bit
 static inline void pushSeg(std::vector<Seg>& segs, uint8_t level, uint32_t dur) {
   if (!dur) return;
   if (!segs.empty() && segs.back().level == level) {
@@ -241,13 +241,11 @@ static inline void pushSeg(std::vector<Seg>& segs, uint8_t level, uint32_t dur) 
   }
 }
 
-// Build RAW (ON/OFF, µs) into Segs, chunking long durations to avoid 15-bit RMT caps
+// Chunk long durations to stay under RMT and 16-bit caps.
 static inline void addSegChunked(std::vector<Seg>& out, uint8_t level, uint32_t us) {
-  // Keep individual segments <= 30000 µs so both Seg.us (uint16_t) and RMT half-item limits are safe
   const uint32_t max_chunk = 30000;
   while (us) {
     uint16_t piece = (uint16_t)std::min<uint32_t>(us, max_chunk);
-    // pushSeg(out, level, piece);
     out.push_back(Seg{level, piece});
     us -= piece;
   }
@@ -256,18 +254,14 @@ static inline void addSegChunked(std::vector<Seg>& out, uint8_t level, uint32_t 
 static void buildRawSegs_FromOnOffTimings(const std::vector<uint32_t>& timings_us,
                                           std::vector<Seg>& segs_out,
                                           bool ensure_trailing_low = true) {
-  uint8_t level = 1; // RAW starts with ON=HIGH
+  uint8_t level = 1; // RAW starts ON=HIGH
   for (uint32_t d : timings_us) {
     addSegChunked(segs_out, level, d);
     level ^= 1;
   }
-  if (ensure_trailing_low) {
-    // make sure line idles LOW between repeats/frames
-    addSegChunked(segs_out, 0, 1);
-  }
+  if (ensure_trailing_low) addSegChunked(segs_out, 0, 1);
 }
 
-// SegsToRmt — convert compact (level,µs) segments to rmt_item32_t
 static void SegsToRmt(const std::vector<Seg>& segs, uint32_t clk_hz, std::vector<rmt_item32_t>& out) {
   if (!clk_hz) clk_hz = RMT_TICKS_PER_SEC;
   auto us_to_ticks = [clk_hz](uint32_t us) -> uint32_t {
@@ -293,13 +287,15 @@ static void SegsToRmt(const std::vector<Seg>& segs, uint32_t clk_hz, std::vector
   }
 }
 
+// ============================================================================
+// 12) TX LED guard (optional)
+// ============================================================================
 #if FUNKBUS_LED_TX_ENABLE
 static inline void tx_led_write(bool on) {
   digitalWrite(FUNKBUS_LED_TX_GPIO,
                (FUNKBUS_LED_TX_ACTIVE_HIGH ? (on ? HIGH : LOW)
                                            : (on ? LOW : HIGH)));
 }
-
 struct TxLedGuard {
   TxLedGuard() {
     pinMode(FUNKBUS_LED_TX_GPIO, OUTPUT);
@@ -309,16 +305,18 @@ struct TxLedGuard {
 };
 #endif
 
+// ============================================================================
+// 13) RAW TX helpers (GPIO & RMT) — public via FunkbusRemote
+// ============================================================================
 namespace FunkbusRemote {
 
-// Send one ON/OFF timings[] sequence once via GPIO (starts ON=HIGH)
 static bool SendOnOffTimingsGPIO(const std::vector<uint32_t>& timings) {
 #if defined(FUNKBUS_CC1101_GDO0_MCU)
   pinMode(FUNKBUS_CC1101_GDO0_MCU, OUTPUT);
-  uint8_t level = HIGH; // first entry = ON
+  uint8_t level = HIGH;
   for (uint32_t us : timings) {
     digitalWrite(FUNKBUS_CC1101_GDO0_MCU, level);
-    ets_delay_us(us); // precise busy wait
+    ets_delay_us(us);
     level = (level == HIGH) ? LOW : HIGH;
   }
   digitalWrite(FUNKBUS_CC1101_GDO0_MCU, LOW);
@@ -345,21 +343,17 @@ bool TxRawSingle(uint32_t freq_hz,
   TxLedGuard _tx_led_on;
 #  endif
 
-  // Try RMT first (reusing the existing session wrapper & converters)
   {
-    RmtTxSession txMain(
-        kRmtTxChannel,
-        static_cast<gpio_num_t>(FUNKBUS_CC1101_GDO0_MCU),
-        kRmtClkDiv);
+    RmtTxSession txMain(kRmtTxChannel,
+                        static_cast<gpio_num_t>(FUNKBUS_CC1101_GDO0_MCU),
+                        kRmtClkDiv);
 
     if (txMain.begin()) {
       const uint32_t clk_main_hz = txMain.counter_hz();
 
       std::vector<Seg> segs;
-      segs.clear();
       segs.reserve(timings_us.size() * repeats + 8);
 
-      // Build all repeats + inter-repeat gaps into one contiguous segment list
       for (uint32_t i = 0; i < repeats; ++i) {
         buildRawSegs_FromOnOffTimings(timings_us, segs, /*ensure_trailing_low=*/true);
         if (i + 1 < repeats) {
@@ -368,7 +362,6 @@ bool TxRawSingle(uint32_t freq_hz,
         }
       }
 
-      // Convert and write in one shot
       std::vector<rmt_item32_t> items;
       SegsToRmt(segs, clk_main_hz, items);
       FB_VLOG(F("[RAW-TX] items=%u segs=%u clk=%uHz" CR),
@@ -385,7 +378,7 @@ bool TxRawSingle(uint32_t freq_hz,
     }
   }
 
-  // Fallback: original GPIO-timed path (unchanged)
+  // GPIO fallback
   for (uint32_t i = 0; i < repeats; ++i) {
     if (!SendOnOffTimingsGPIO(timings_us)) {
       FB_LOG_E(F("[RAW-TX] GPIO send failed at repeat %u" CR), (unsigned)i);
@@ -429,17 +422,14 @@ bool TxRawPlaylist(uint32_t freq_hz,
 #  endif
 
   {
-    RmtTxSession txMain(
-        kRmtTxChannel,
-        static_cast<gpio_num_t>(FUNKBUS_CC1101_GDO0_MCU),
-        kRmtClkDiv);
+    RmtTxSession txMain(kRmtTxChannel,
+                        static_cast<gpio_num_t>(FUNKBUS_CC1101_GDO0_MCU),
+                        kRmtClkDiv);
 
     if (txMain.begin()) {
       const uint32_t clk_main_hz = txMain.counter_hz();
 
       std::vector<Seg> segs;
-      segs.clear();
-      // Pre-size generously to avoid reallocs
       size_t est = 0;
       for (const auto& f : frames) est += f.size();
       segs.reserve(est + frames.size() * 4);
@@ -468,7 +458,7 @@ bool TxRawPlaylist(uint32_t freq_hz,
     }
   }
 
-  // Fallback GPIO (existing behavior)
+  // GPIO fallback
   for (size_t i = 0; i < frames.size(); ++i) {
     if (!SendOnOffTimingsGPIO(frames[i])) {
       FB_LOG_E(F("[RAW-TX] GPIO send failed at frame %u" CR), (unsigned)i);
@@ -497,9 +487,9 @@ bool TxRawPlaylist(uint32_t freq_hz,
 
 } // namespace FunkbusRemote
 
-// =====================================================================================
-// Tiny TX state machine types
-// =====================================================================================
+// ============================================================================
+// 14) Tiny TX state machine & timing helpers
+// ============================================================================
 enum class TxState : uint8_t { Idle,
                                ArmRadio,
                                SendFrame,
@@ -508,36 +498,28 @@ enum class TxState : uint8_t { Idle,
 
 struct TxCycle {
   TxState state = TxState::Idle;
-  size_t idx = 0; // current frame index
-  int64_t next_due_us = 0; // absolute timestamp in micros
+  size_t idx = 0;
+  int64_t next_due_us = 0;
 };
 
-// -------------------------------------------------------------------------------------
-// nowMicros — monotonic microsecond timer (ESP32 uses esp_timer)">
-static inline int64_t nowMicros() {
-  return esp_timer_get_time();
-}
+static inline int64_t nowMicros() { return esp_timer_get_time(); }
 
-// waitUntilMicros — busy/RTOS-wait until absolute timestamp, minimizing jitter">
 static inline void waitUntilMicros(int64_t ts_abs) {
   for (;;) {
     const int64_t t = nowMicros();
     int64_t remain = ts_abs - t;
     if (remain <= 0) break;
-
     if (remain > FUNKBUS_WAIT_YIELD_US) {
-      vTaskDelay(1); // release CPU for a tick
+      vTaskDelay(1);
       continue;
     }
-    taskYIELD(); // short spin/yield near the edge
+    taskYIELD();
   }
 }
 
-// =====================================================================================
-// MQTT helpers for returning command results
-// =====================================================================================
-
-// fb_publish_json — serialize and publish a small result JSON via Theengs/OMG">
+// ============================================================================
+// 15) MQTT helper to publish small JSON acks/results
+// ============================================================================
 static inline void fb_publish_json(const JsonDocument& doc) {
   String out;
   out.reserve(FUNKBUS_JSON_RESERVE_TX);
@@ -547,14 +529,17 @@ static inline void fb_publish_json(const JsonDocument& doc) {
   pub(FUNKBUS_CMD_RESULT_TOPIC, out.c_str());
 }
 
-// =====================================================================================
+// ============================================================================
+// 16) CC1101 dumps → JSON (guarded by ZradioCC1101)
+// ============================================================================
 #ifdef ZradioCC1101
-// PublishCC1101RegistersJson — read CC1101 config/status/PA and publish as JSON">
 static void PublishCC1101RegistersJson() {
   StaticJsonDocument<2048> d;
   d["type"] = "cc1101_dump";
 
-  uint8_t regs_arr[CC1101_NUM_CONFIG_REGS] = {0}, status_arr[CC1101_NUM_STATUS_REGS] = {0}, pa_tbl[CC1101_PATABLE_SIZE] = {0};
+  uint8_t regs_arr[CC1101_NUM_CONFIG_REGS] = {0},
+          status_arr[CC1101_NUM_STATUS_REGS] = {0},
+          pa_tbl[CC1101_PATABLE_SIZE] = {0};
   FunkbusTB::readAllRegisters(regs_arr, status_arr, pa_tbl);
 
   JsonArray regs = d.createNestedArray("regs");
@@ -578,12 +563,11 @@ static void PublishCC1101RegistersJson() {
 
   fb_publish_json(d);
 }
-
 #endif
 
-// =====================================================================================
-// CC1101 helpers & debug glue
-// =====================================================================================
+// ============================================================================
+// 17) CC1101 TX frequency guard (RAII) — hop to TX MHz, then restore
+// ============================================================================
 #if FUNKBUS_REG_DUMPS >= 1
 #  define DUMP_REGS() FunkbusTB::DumpRegistersHexLogs()
 #else
@@ -593,36 +577,31 @@ static void PublishCC1101RegistersJson() {
 #endif
 
 namespace {
-// TxFreqGuard — RAII switch to TX MHz during a TX scope (restores listen MHz on exit)">
 struct TxFreqGuard {
   float prev = NAN;
   explicit TxFreqGuard(float tx_mhz) {
 #ifdef ZradioCC1101
-    prev = FunkbusTB::GetPersistedMhz(); // persisted target from NVS
+    prev = FunkbusTB::GetPersistedMhz();
     FunkbusTB::setMHz(tx_mhz);
     DUMP_REGS();
 #endif
   }
   ~TxFreqGuard() {
 #ifdef ZradioCC1101
-    if (!isnan(prev)) {
-      FunkbusTB::setMHz(prev);
-    }
+    if (!isnan(prev)) FunkbusTB::setMHz(prev);
     DUMP_REGS();
 #endif
   }
 };
-
 } // namespace
 
-// -----------------------------------------------------------------------------
-// Extended RAW TX (validation + logging only; no RF action yet)
-// -----------------------------------------------------------------------------
-#include <ArduinoJson.h> // local include in .cpp is safe
+// ============================================================================
+// 18) Extended RAW TX command (validation/logging + dispatch)
+// ============================================================================
+#include <ArduinoJson.h> // local include is fine in .cpp
 
 namespace {
 
-// Read [uint32,...] into vector
 static bool fb_ReadUIntArray(JsonVariant v, std::vector<uint32_t>& out) {
   out.clear();
   if (!v.is<JsonArray>()) return false;
@@ -633,7 +612,6 @@ static bool fb_ReadUIntArray(JsonVariant v, std::vector<uint32_t>& out) {
   return true;
 }
 
-// Read frames: [{ "timings_us":[...] }, ...]
 static bool fb_ReadFramesArray(JsonVariant v, std::vector<std::vector<uint32_t>>& frames) {
   frames.clear();
   if (!v.is<JsonArray>()) return false;
@@ -649,9 +627,7 @@ static bool fb_ReadFramesArray(JsonVariant v, std::vector<std::vector<uint32_t>>
 
 static void fb_log_preview_timings(const std::vector<uint32_t>& v, size_t maxn, const char* tag) {
   const size_t n = std::min(v.size(), maxn);
-  for (size_t i = 0; i < n; ++i) {
-    FB_LOG_N(F("[RAW-TX]   %s[%u]=%u"), tag, (unsigned)i, (unsigned)v[i]);
-  }
+  for (size_t i = 0; i < n; ++i) FB_LOG_N(F("[RAW-TX]   %s[%u]=%u"), tag, (unsigned)i, (unsigned)v[i]);
   FB_LOG_N(F(CR));
 }
 
@@ -660,7 +636,6 @@ static void fb_log_preview_timings(const std::vector<uint32_t>& v, size_t maxn, 
 namespace FunkbusRemote {
 
 bool HandleExtRawTx(const String& json) {
-  // Use a dynamic doc sized to input; add slack for keys
   DynamicJsonDocument doc(json.length() + 1024);
   DeserializationError err = deserializeJson(doc, json);
   if (err) {
@@ -669,7 +644,6 @@ bool HandleExtRawTx(const String& json) {
   }
   JsonObject root = doc.as<JsonObject>();
   if (!root.containsKey("ext_raw_v")) {
-    // Not for us
     FB_VLOG(F("[RAW-TX] ext_raw_v missing (ignored)"));
     return false;
   }
@@ -680,7 +654,7 @@ bool HandleExtRawTx(const String& json) {
     return false;
   }
 
-  // frequency (prefer Hz; accept MHz under 'frequency')
+  // frequency (Hz preferred; support MHz field too)
   uint32_t freq_hz = 0;
   if (root.containsKey("frequency_hz"))
     freq_hz = root["frequency_hz"].as<uint32_t>();
@@ -692,9 +666,7 @@ bool HandleExtRawTx(const String& json) {
   String modulation;
   if (root.containsKey("modulation")) modulation = root["modulation"].as<const char*>();
 
-  // =========================
-  // (A) Single-frame variant
-  // =========================
+  // (A) Single frame
   if (root.containsKey("timings_us")) {
     std::vector<uint32_t> timings, gaps;
     if (!fb_ReadUIntArray(root["timings_us"], timings)) {
@@ -729,9 +701,7 @@ bool HandleExtRawTx(const String& json) {
     return TxRawSingle(freq_hz, modulation.c_str(), timings, repeats, gaps);
   }
 
-  // =========================
-  // (B) Playlist variant
-  // =========================
+  // (B) Playlist
   if (root.containsKey("frames")) {
     std::vector<std::vector<uint32_t>> frames;
     if (!fb_ReadFramesArray(root["frames"], frames)) {
@@ -742,7 +712,6 @@ bool HandleExtRawTx(const String& json) {
       FB_LOG_E(F("[RAW-TX] frames[] is empty" CR));
       return false;
     }
-    // Validate each frame
     for (size_t i = 0; i < frames.size(); ++i) {
       const auto& t = frames[i];
       if (t.size() < 2 || (t.size() & 1) != 0) {
@@ -783,9 +752,9 @@ bool HandleExtRawTx(const String& json) {
 
 } // namespace FunkbusRemote
 
-// =====================================================================================
-// Validation & mapping helpers
-// =====================================================================================
+// ============================================================================
+// 19) Validation & mapping helpers + bit builders (String + zero-alloc)
+// ============================================================================
 static inline bool isHexChar(char c) {
   c = (char)toupper((unsigned char)c);
   return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F');
@@ -807,7 +776,6 @@ static inline bool isValidDuration(String d) {
   return (d == "S" || d == "L");
 }
 
-// ValidatePayload — strict-check JSON fields and normalize strings">
 bool FunkbusRemote::ValidatePayload(const String& jsonText, FunkbusPayload* out, String* error) {
   FB_VLOG(F("ValidatePayload: %s" CR), jsonText.c_str());
 
@@ -915,7 +883,6 @@ static String MapChannelBits(const String& ch) {
 }
 static String MapActionBit(const String& a) { return (a == "ON") ? String(FUNKBUS_ACT_ON) : String(FUNKBUS_ACT_OFF); }
 
-// BuildFirst40Bits — String-based builder (kept for callers); prefer *_buf version in hot path">
 String FunkbusRemote::BuildFirst40Bits(const FunkbusPayload& p, String* error) {
   if (p.serial.length() != SERIAL_HEX_LEN) {
     if (error) *error = F("serial must be 5 hex");
@@ -941,7 +908,7 @@ String FunkbusRemote::BuildFirst40Bits(const FunkbusPayload& p, String* error) {
   return bits;
 }
 
-// ===== SCOM / parity / checksum (String path kept for parity with *_buf logic) =====
+// ---- SCOM/parity/checksum (String path) ------------------------------------
 static String MapScomBits(uint8_t serial) {
   static const char* SCOM[SCOM_MAX + 1] = {"000", "100", "010", "110", "001", "101", "011", "111"};
   return String((serial < 8) ? SCOM[serial] : "000");
@@ -978,7 +945,6 @@ static String ComputeChecksum4(const String& first43) {
   return String(NIBBLE_BIN[res]);
 }
 
-// Build48BitFrame — String-based builder; prefer *_buf where performance matters">
 String FunkbusRemote::Build48BitFrame(const String& first40Bits, uint8_t frameSerial, String* error) {
   if (first40Bits.length() != FIRST40_BITS) {
     if (error) *error = F("first40Bits must be 40 bits");
@@ -999,11 +965,7 @@ String FunkbusRemote::Build48BitFrame(const String& first40Bits, uint8_t frameSe
   return out;
 }
 
-// =====================================================================================
-// Zero-alloc bit builders (preferred in hot paths)
-// =====================================================================================
-
-// nibble_to_bin / hex_val_uc / map_button_bits / map_channel_bits / parity & checksum helpers">
+// ---- Zero-alloc builders (preferred hot path) -------------------------------
 static inline void nibble_to_bin(uint8_t v, char* dst) {
   dst[0] = (v & 0x8) ? '1' : '0';
   dst[1] = (v & 0x4) ? '1' : '0';
@@ -1021,10 +983,9 @@ static inline void map_button_bits(uint8_t button, char out3[3]) {
   out3[2] = s[2];
 }
 static inline void map_channel_bits(const String& ch, char out2[2]) {
-  const char* src =
-      (ch == "A") ? FUNKBUS_CH_A : (ch == "B") ? FUNKBUS_CH_B
-                               : (ch == "C")   ? FUNKBUS_CH_C
-                                               : FUNKBUS_CH_LS;
+  const char* src = (ch == "A") ? FUNKBUS_CH_A : (ch == "B") ? FUNKBUS_CH_B
+                                             : (ch == "C")   ? FUNKBUS_CH_C
+                                                             : FUNKBUS_CH_LS;
   out2[0] = src[0];
   out2[1] = src[1];
 }
@@ -1066,7 +1027,7 @@ static inline void hex5_to_20bits_uc(const String& hex5_uc, char out20[SERIAL_BI
 }
 
 namespace FunkbusRemote {
-// BuildFirst40Bits_buf — zero-alloc first-40 builder for hot path TX">
+
 bool BuildFirst40Bits_buf(const FunkbusPayload& p, char out40[FIRST40_STRLEN], std::string* /*error*/) {
   if (p.serial.length() != 5) {
     out40[0] = '\0';
@@ -1074,7 +1035,6 @@ bool BuildFirst40Bits_buf(const FunkbusPayload& p, char out40[FIRST40_STRLEN], s
   }
 
   int idx = 0;
-
   memcpy(&out40[idx], FUNKBUS_RC_TYPE, 4);
   idx += 4;
   memcpy(&out40[idx], FUNKBUS_RC_SUBTYPE, 4);
@@ -1109,7 +1069,6 @@ bool BuildFirst40Bits_buf(const FunkbusPayload& p, char out40[FIRST40_STRLEN], s
   return true;
 }
 
-// Build48BitFrame_buf — zero-alloc 48-bit builder with SCOM/parity/checksum">
 bool Build48BitFrame_buf(const char first40[FIRST40_STRLEN], uint8_t frameSerial, char out48[FRAME_STRLEN], std::string* /*error*/) {
   if (std::strlen(first40) != 40) {
     out48[0] = '\0';
@@ -1145,9 +1104,14 @@ bool Build48BitFrame_buf(const char first40[FIRST40_STRLEN], uint8_t frameSerial
 
 } // namespace FunkbusRemote
 
+// ============================================================================
+// 20) Internal: frame TX state machine (RMT) for four 48-bit frames
+// ============================================================================
 namespace {
-// SendFramesWithStateMachine48 — schedule & transmit four 48-bit frames with precise per-channel gaps">
-static void SendFramesWithStateMachine48(const std::vector<const char*>& frames, RmtTxSession& txMain, uint32_t clk_main_hz) {
+
+static void SendFramesWithStateMachine48(const std::vector<const char*>& frames,
+                                         RmtTxSession& txMain,
+                                         uint32_t clk_main_hz) {
   auto BitsToSegments_noalloc48 = [](const char* bits, std::vector<Seg>& segs) -> uint32_t {
     segs.clear();
     segs.reserve(128);
@@ -1194,7 +1158,6 @@ static void SendFramesWithStateMachine48(const std::vector<const char*>& frames,
   };
 
   std::vector<rmt_item32_t> rmt_main;
-
   std::vector<Seg> segbuf;
 
   TxCycle sm;
@@ -1222,19 +1185,13 @@ static void SendFramesWithStateMachine48(const std::vector<const char*>& frames,
         SegsToRmt(segbuf, clk_main_hz, rmt_main);
 
         const int64_t t_before = nowMicros();
-        txMain.write(rmt_main); // may block until MAIN frame done
+        txMain.write(rmt_main);
         const int64_t t_after = nowMicros();
 
-        static int64_t s_prev_frame_end = 0;
-        int64_t this_frame_end = t_after; // end of MAIN write is a good proxy
-        s_prev_frame_end = this_frame_end;
-
         const bool write_blocked = (t_after - t_before) > (int64_t)(frame_us / 2);
-
         sm.next_due_us = write_blocked
                              ? (t_after + (int64_t)FUNKBUS_INTERFRAME_GAP_US)
                              : (t_before + (int64_t)frame_us + (int64_t)FUNKBUS_INTERFRAME_GAP_US);
-
         sm.state = TxState::Gap;
         break;
       }
@@ -1262,9 +1219,9 @@ static void SendFramesWithStateMachine48(const std::vector<const char*>& frames,
 
 } // namespace
 
-// =====================================================================================
-// Formatting helpers (debug)
-// =====================================================================================
+// ============================================================================
+// 21) Formatting helper (debug)
+// ============================================================================
 static String BitsToHex(const String& bits) {
   if (bits.length() % 4 != 0) return String("??");
   String hex;
@@ -1278,11 +1235,9 @@ static String BitsToHex(const String& bits) {
   return hex;
 }
 
-// =====================================================================================
-// Public: create & transmit frames
-// =====================================================================================
-
-// Create_and_TransmitFrames — build 4×48-bit frames from bits40/duration/action and send over RF">
+// ============================================================================
+// 22) Public: build 4×48-bit frames and transmit over RF
+// ============================================================================
 void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
                                               const String& channel,
                                               uint8_t button,
@@ -1331,13 +1286,11 @@ void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
 #  endif
 
   {
-    RmtTxSession txMain(
-        kRmtTxChannel,
-        static_cast<gpio_num_t>(FUNKBUS_CC1101_GDO0_MCU),
-        kRmtClkDiv);
+    RmtTxSession txMain(kRmtTxChannel,
+                        static_cast<gpio_num_t>(FUNKBUS_CC1101_GDO0_MCU),
+                        kRmtClkDiv);
 
     const bool ok_main = txMain.begin();
-
     if (ok_main) {
       const uint32_t clk_main_hz = txMain.counter_hz();
 
@@ -1346,14 +1299,12 @@ void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
         String bits(bits_cstr);
         String hex = BitsToHex(bits);
 
-        // Read the 3 SCOM bits from the frame
         char scom3[4];
         scom3[0] = bits_cstr[SCOM_START_BIT + 0];
         scom3[1] = bits_cstr[SCOM_START_BIT + 1];
         scom3[2] = bits_cstr[SCOM_START_BIT + 2];
         scom3[3] = '\0';
 
-        // Decode using Funkbus mapping (left→right weights 1,2,4)
         const uint8_t scom =
             (scom3[0] == '1' ? 1 : 0) |
             (scom3[1] == '1' ? 2 : 0) |
@@ -1369,7 +1320,6 @@ void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
       pinMode(FUNKBUS_CC1101_GDO0_MCU, OUTPUT);
       digitalWrite(FUNKBUS_CC1101_GDO0_MCU, LOW);
 
-      // One-liner TX summary at NOTICE (per command)
       FB_LOG_N(F("[funkbus_tx] ch=%s btn=%u action=%s frames=%d duration=%s" CR),
                channel.c_str(), (unsigned)button, action.c_str(),
                FUNKBUS_TX_FRAMES_PER_BURST, (duration == "L") ? "L" : "S");
@@ -1379,6 +1329,7 @@ void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
     }
   }
 
+  // GPIO fallback (no RMT)
   FB_VLOG(F("GPIO-timed TX (no RMT)" CR));
   pinMode(FUNKBUS_CC1101_GDO0_MCU, OUTPUT);
 
@@ -1413,7 +1364,6 @@ void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
 
     for (const auto& s : segs_one) {
       digitalWrite(FUNKBUS_CC1101_GDO0_MCU, s.level ? HIGH : LOW);
-
       delayMicroseconds(s.us);
     }
     digitalWrite(FUNKBUS_CC1101_GDO0_MCU, LOW);
@@ -1421,7 +1371,6 @@ void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
     if (i + 1 < frames_ptr.size()) delayMicroseconds(FUNKBUS_INTERFRAME_GAP_US);
   }
 
-  // One-liner TX summary at NOTICE (per command)
   FB_LOG_N(F("[funkbus_tx] ch=%s btn=%u action=%s frames=%d duration=%s" CR),
            channel.c_str(), (unsigned)button, action.c_str(),
            FUNKBUS_TX_FRAMES_PER_BURST, (duration == "L") ? "L" : "S");
@@ -1436,11 +1385,9 @@ void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
 #endif // ZradioCC1101
 }
 
-// =====================================================================================
-// CC1101 command dispatcher
-// =====================================================================================
-
-// HandleCc1101Command — dispatch small JSON commands for CC1101 (dump, get/set listen MHz, carrier)">
+// ============================================================================
+// 23) CC1101 command dispatcher (JSON) — small debug cmds
+// ============================================================================
 bool FunkbusRemote::HandleCc1101Command(const String& json) {
   StaticJsonDocument<256> doc;
   if (deserializeJson(doc, json)) return false;
@@ -1452,7 +1399,6 @@ bool FunkbusRemote::HandleCc1101Command(const String& json) {
   const char* cmd = doc["cmd"];
   if (!cmd || !*cmd) return false;
 
-  // ICommand received – verbose (TRACE), not NOTICE
   FB_VLOG(F("[CC1101 CMD] received: %s" CR), cmd);
 
   if (!strcmp(cmd, "cc1101_dump")) {
@@ -1483,11 +1429,9 @@ bool FunkbusRemote::HandleCc1101Command(const String& json) {
 #endif
 }
 
-// =====================================================================================
-// Debug helpers
-// =====================================================================================
-
-// Debug_TxCarrierMs — generate a solid OOK carrier for ms (LED test for RF path)">
+// ============================================================================
+// 24) Debug helper: solid OOK carrier for ms
+// ============================================================================
 void FunkbusRemote::Debug_TxCarrierMs(uint32_t ms) {
 #ifdef ZradioCC1101
   FunkbusTB::beginTxSession();

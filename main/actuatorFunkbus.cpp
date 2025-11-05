@@ -1,39 +1,36 @@
-/*
-  OpenMQTTGateway - Funkbus TX module
-
-  This actuator module wires Funkbus transmission into OMG when the build flag
-  ZactuatorFunkbus is enabled. It exposes XtoFunkbus() to handle JSON commands.
-  In TX-only builds (no ZgatewayFunkbus), it also provides setupFunkbus() so
-  main.cpp links without pulling RX.
-
-  Build flags:
-    - ZactuatorFunkbus : enable this TX actuator
-    - ZgatewayFunkbus  : optional; when present, RX lives in gatewayFunkbus.cpp
-
-  Notes:
-    - No <ArduinoJson.h> include here; types come transitively from the app.
-    - This module does not start RX; RX lifecycle is in gatewayFunkbus.cpp.
-
-  License: MIT
-*/
+//
+// OpenMQTTGateway — Funkbus TX actuator
+//
+// Wires Funkbus transmission into OMG when ZactuatorFunkbus is enabled.
+// Provides XtoFunkbus() to handle JSON commands. In TX-only builds (no
+// ZgatewayFunkbus), also provides setupFunkbus() for link completeness.
+//
+// Build flags:
+//   - ZactuatorFunkbus : enable this TX actuator
+//   - ZgatewayFunkbus  : optional; RX lives in gatewayFunkbus.cpp
+//
+// Notes:
+//   - No <ArduinoJson.h> include here; types come transitively from the app.
+//   - RX lifecycle is owned by gatewayFunkbus.cpp.
+//
+// License: MIT
+//
 
 #include <Arduino.h>
 
 #include "User_config.h"
 
+
 #ifdef ZactuatorFunkbus
 
-// --- Project headers --------------------------------------------------------
+// ---- Project headers --------------------------------------------------------
 #  include "config_Funkbus.h"
 #  include "modules/funkbus/funkbus_cc1101_toolbox.h"
 #  include "modules/funkbus/funkbus_log.h"
 #  include "modules/funkbus/funkbus_tx.h"
 
-// --- Init guard -------------------------------------------------------------
-
-/**
- * @brief Ensure CC1101 toolbox and perfmon are initialized exactly once.
- */
+// ---- Init guard -------------------------------------------------------------
+// Ensure CC1101 toolbox is initialized exactly once.
 static void ensureFbInitOnce() {
   static bool done = false;
   if (!done) {
@@ -42,15 +39,12 @@ static void ensureFbInitOnce() {
   }
 }
 
-// --- JSON entry point -------------------------------------------------------
-
-/**
- * @brief OMG JSON dispatcher for Funkbus TX.
- *
- * Routes:
- *   - {"cmd": "..."}                 : CC1101 diagnostic/tuning commands
- *   - Funkbus telegram payload       : build & transmit frames
- */
+// ---- JSON entry point -------------------------------------------------------
+// Dispatch Funkbus-related JSON.
+// Routes:
+//   - {"cmd": "..."}        : CC1101 diagnostic/tuning commands
+//   - {"ext_raw_v": ...}    : extended raw OOK TX (non-Funkbus)
+//   - Funkbus telegram      : build and transmit protocol frames
 void XtoFunkbus(const char* topic, JsonObject& root) {
   (void)topic;
   ensureFbInitOnce();
@@ -60,7 +54,7 @@ void XtoFunkbus(const char* topic, JsonObject& root) {
 
   const bool has_cmd = root.containsKey("cmd");
 
-  // CC1101 diagnostic/tuning commands
+  // CC1101 diagnostic/tuning commands.
   if (has_cmd) {
     FB_VLOG(F("[Funkbus] route=CMD" CR));
     if (!FunkbusRemote::HandleCc1101Command(json)) {
@@ -69,16 +63,16 @@ void XtoFunkbus(const char* topic, JsonObject& root) {
     return;
   }
 
-  // EXTENDED RAW TX fast-path: Transmit RAW signals that are not Funkbus related
+  // Fast path: transmit non-Funkbus raw signals.
   if (root.containsKey("ext_raw_v")) {
     FB_VLOG(F("[Funkbus] route=EXT_RAW_V" CR));
     if (!FunkbusRemote::HandleExtRawTx(json)) {
       FB_LOG_W(F("[Funkbus] Unknown/failed cmd" CR));
     }
-    return; // do not fall through to other handlers
+    return; // do not fall through to telegram handler
   }
 
-  // Transmit a Funkbus telegram
+  // Transmit a Funkbus telegram.
   FB_VLOG(F("[Funkbus] route=TELEGRAM -> ValidatePayload" CR));
 
   FunkbusPayload p;
@@ -103,15 +97,10 @@ void XtoFunkbus(const char* topic, JsonObject& root) {
       bits40, p.channel, p.button, p.action, p.duration);
 }
 
-// --- TX-only setup (for link completeness) ---------------------------------
+// ---- TX-only setup (for link completeness) ---------------------------------
 // When ZgatewayFunkbus is present, the gateway module provides setupFunkbus().
-
 #  ifndef ZgatewayFunkbus
-/**
- * @brief Provide setup hook in TX-only builds (no RX).
- *
- * Ensures that the CC1101/perf tooling is initialized even if only TX is built.
- */
+// Provide setup hook in TX-only builds (no RX).
 void setupFunkbus() {
   ensureFbInitOnce();
 }

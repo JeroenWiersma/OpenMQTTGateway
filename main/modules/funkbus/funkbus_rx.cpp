@@ -1,10 +1,13 @@
 #include "funkbus_rx.h"
 
-// ============================================================================
+//
 // funkbus_rx.cpp — ESP32 RMT-based Funkbus receiver
-// Role: Capture CC1101 GDO0 pulses, decode 48-bit Funkbus frames, group
-//       repeated presses, and publish results via OMG pub().
-// ============================================================================
+//
+// Captures CC1101 GDO0 pulses, decodes 48-bit Funkbus frames, groups repeated
+// presses, and publishes results via OMG pub().
+//
+// License: MIT
+//
 
 #include <Arduino.h>
 
@@ -17,9 +20,7 @@
 #  error "Funkbus RX requires ESP32 (RMT). Build on ESP32 or disable Funkbus RX."
 #endif
 
-// ============================================================================
-// 1) USER-FACING: RX activity LED (can be overridden in config_Funkbus.h)
-// ============================================================================
+// ---- 1) User-facing: RX activity LED (override in config_Funkbus.h) --------
 #ifndef FUNKBUS_LED_RX_ENABLE
 #  define FUNKBUS_LED_RX_ENABLE 1 // 1: flash LED on RX activity
 #endif
@@ -27,176 +28,134 @@
 #if FUNKBUS_LED_RX_ENABLE
 #  ifndef FUNKBUS_LED_RX_GPIO
 #    ifdef LED_BUILTIN
-#      define FUNKBUS_LED_RX_GPIO LED_BUILTIN // GPIO for RX LED (default to built-in LED)
+#      define FUNKBUS_LED_RX_GPIO LED_BUILTIN // default: built-in LED
 #    else
-#      define FUNKBUS_LED_RX_GPIO 2 // Fallback GPIO if LED_BUILTIN not defined
+#      define FUNKBUS_LED_RX_GPIO 2 // fallback GPIO
 #    endif
 #  endif
 #  ifndef FUNKBUS_LED_RX_MS
 #    define FUNKBUS_LED_RX_MS 60 // LED on-time per RX event (ms)
 #  endif
 #  ifndef FUNKBUS_LED_ACTIVE_HIGH
-#    define FUNKBUS_LED_ACTIVE_HIGH 1 // 1: LED active high, 0: active low
+#    define FUNKBUS_LED_ACTIVE_HIGH 1 // 1: LED active HIGH, 0: active LOW
 #  endif
 #endif
 
-// ============================================================================
-// 2) RMT HW SETUP & LOW-LEVEL TIMERS
-// ============================================================================
+// ---- 2) RMT HW setup & low-level timers ------------------------------------
+constexpr uint32_t FUNKBUS_RMT_CLKDIV = 80; // 80MHz/80 => 1 MHz tick
+constexpr int FUNKBUS_RMT_RX_CHANNEL = RMT_CHANNEL_2;
+constexpr uint8_t FUNKBUS_RMT_MEMBLOCKS = 4;
 
-// RMT configuration constants (migrated from #define → constexpr)
-constexpr uint32_t FUNKBUS_RMT_CLKDIV = 80; // RMT clock divider: 80MHz/80 = 1MHz tick (1 µs)
-constexpr int FUNKBUS_RMT_RX_CHANNEL = RMT_CHANNEL_2; // RMT channel used for RX capture (cast where used)
-constexpr uint8_t FUNKBUS_RMT_MEMBLOCKS = 4; // RMT memory blocks reserved for RX
-
-// Performance monitoring thresholds (migrated)
-constexpr uint32_t FUNKBUS_PERF_RXRECV_BUDGET_US = 6000; // Warn/log if RX loop exceeds this time (µs)
-constexpr uint32_t FUNKBUS_PERF_RXRECV_EVERY_N = 0; // Force log every N packets (0 = disabled)
+constexpr uint32_t FUNKBUS_PERF_RXRECV_BUDGET_US = 6000; // warn if RX loop > this
+constexpr uint32_t FUNKBUS_PERF_RXRECV_EVERY_N = 0; // force log every N packets (0=off)
 
 namespace {
-// RMT timing helpers (internal/private)
-inline constexpr uint32_t kRmtTickUs = 1; // RMT tick duration in microseconds
-inline constexpr uint16_t kRmtGlitchUs = 130; // Ignore pulses shorter than this (µs)
-inline constexpr uint32_t kRmtIdleThUs = 25000; // Idle threshold to trigger end-of-RX (µs)
-inline constexpr uint32_t kRmtRecvTimeoutMs = 5; // Ringbuffer read timeout (ms)
-inline constexpr size_t kRmtRingbufBytes = 32768; // Size of RMT ringbuffer (bytes)
+inline constexpr uint32_t kRmtTickUs = 1; // 1 µs per tick
+inline constexpr uint16_t kRmtGlitchUs = 130; // ignore pulses < this (µs)
+inline constexpr uint32_t kRmtIdleThUs = 25000; // idle ends burst (µs)
+inline constexpr uint32_t kRmtRecvTimeoutMs = 5; // ringbuffer read timeout
+inline constexpr size_t kRmtRingbufBytes = 32768; // ringbuffer size
 } // namespace
 
-// ============================================================================
-// 3) OPTIONAL: Gate RX by CC1101 GDO2 and worker task parameters
-// ============================================================================
-
-// Keep feature toggle as a macro (used in #if)
-#define FUNKBUS_RX_GATE_BY_CS 1 // 1: gate RX with GDO2 edges, 0: always-on
-
-// Polarity is runtime-only → constexpr
-constexpr bool FUNKBUS_CS_ACTIVE_HIGH = false; // true: GDO2 high = active, false: low = active
+// ---- 3) Optional: gate RX by CC1101 GDO2 + worker task params --------------
+#define FUNKBUS_RX_GATE_BY_CS 1 // 1: gate RX with GDO2; 0: always-on
+constexpr bool FUNKBUS_CS_ACTIVE_HIGH = false; // true: GDO2 high=active
 
 namespace {
-// GDO2 gating robustness thresholds (internal/private)
-inline constexpr uint32_t kCsMinHighMs = 2; // Min time CS must stay HIGH (ms)
-inline constexpr uint32_t kCsMinOnMs = 12; // Min ON window to consider a valid RX (ms)
-inline constexpr uint32_t kCsMinLowMs = 8; // Min time CS must stay LOW before re-arming (ms)
+inline constexpr uint32_t kCsMinHighMs = 2; // min HIGH time to arm (ms)
+inline constexpr uint32_t kCsMinOnMs = 12; // min ON window (ms)
+inline constexpr uint32_t kCsMinLowMs = 8; // min LOW time to re-arm (ms)
 
-// RX worker task sizing/affinity (internal/private)
-inline constexpr uint32_t kRxWorkerStack = 8192; // RX worker task stack size (bytes)
-inline constexpr UBaseType_t kRxWorkerPrio = configMAX_PRIORITIES - 2; // RX worker priority
+inline constexpr uint32_t kRxWorkerStack = 8192;
+inline constexpr UBaseType_t kRxWorkerPrio = configMAX_PRIORITIES - 2;
 #if defined(ARDUINO_RUNNING_CORE)
-inline constexpr BaseType_t kRxWorkerCore = ARDUINO_RUNNING_CORE; // Pin worker to same core as Arduino
+inline constexpr BaseType_t kRxWorkerCore = ARDUINO_RUNNING_CORE;
 #else
-inline constexpr BaseType_t kRxWorkerCore = 1; // Default core if ARDUINO_RUNNING_CORE not defined
+inline constexpr BaseType_t kRxWorkerCore = 1;
 #endif
 } // namespace
 
-// ============================================================================
-// 4) OPTIONAL PERIODIC DEBUG
-// ============================================================================
+// ---- 4) Optional periodic debug --------------------------------------------
+#define FUNKBUS_RX_DEBUG 0
+constexpr uint32_t FUNKBUS_RX_DEBUG_PERIOD_MS = 5000;
 
-// Keep feature toggle as a macro (used in #if)
-#define FUNKBUS_RX_DEBUG 0 // 1: periodic RX stats logging, 0: off
+// ---- 5) Funkbus symbol thresholds & frame geometry -------------------------
+constexpr uint32_t FUNKBUS_PRE_H_MIN_US = 3300;
+constexpr uint32_t FUNKBUS_PRE_H_MAX_US = 4300;
+constexpr uint32_t FUNKBUS_PRE_L_MIN_US = 900;
+constexpr uint32_t FUNKBUS_PRE_L_MAX_US = 1500;
 
-// Period value is runtime-only → constexpr
-constexpr uint32_t FUNKBUS_RX_DEBUG_PERIOD_MS = 5000; // Period for RX stats logging (ms)
+constexpr uint32_t FUNKBUS_SHORT_MAX_US = 750;
+constexpr uint32_t FUNKBUS_LONG_MIN_US = FUNKBUS_SHORT_MAX_US + 1;
 
-// ============================================================================
-// 5) FUNKBUS SYMBOL THRESHOLDS & FRAME GEOMETRY
-// ============================================================================
-// (Converted to constexpr — no preprocessor conditionals depend on these.)
-constexpr uint32_t FUNKBUS_PRE_H_MIN_US = 3300; // Preamble HIGH: min length (µs)
-constexpr uint32_t FUNKBUS_PRE_H_MAX_US = 4300; // Preamble HIGH: max length (µs)
-constexpr uint32_t FUNKBUS_PRE_L_MIN_US = 900; // Preamble LOW:  min length (µs)
-constexpr uint32_t FUNKBUS_PRE_L_MAX_US = 1500; // Preamble LOW:  max length (µs)
+constexpr uint32_t FUNKBUS_MIN_PULSES = 10;
+constexpr uint32_t FUNKBUS_STARTIDX_FALLBACK = 1;
 
-constexpr uint32_t FUNKBUS_SHORT_MAX_US = 750; // Max duration (µs) for a 'short' pulse
-constexpr uint32_t FUNKBUS_LONG_MIN_US = FUNKBUS_SHORT_MAX_US + 1; // Min duration (µs) for a 'long' pulse
-
-constexpr uint32_t FUNKBUS_MIN_PULSES = 10; // Minimal # of pulses to consider a candidate frame
-constexpr uint32_t FUNKBUS_STARTIDX_FALLBACK = 1; // Fallback index if preamble search fails
-
-constexpr int FUNKBUS_FRAME_BITS = 48; // Total bits per Funkbus frame
+constexpr int FUNKBUS_FRAME_BITS = 48;
 constexpr int FUNKBUS_TRAILER_BITS = 8; // 3 scom + 1 parity + 4 checksum
-constexpr int FUNKBUS_PAYLOAD_BITS = 40; // Bits excluding trailer
-constexpr int FUNKBUS_PARITY_RANGE_BITS = 43; // Bits participating in parity calc
+constexpr int FUNKBUS_PAYLOAD_BITS = 40;
+constexpr int FUNKBUS_PARITY_RANGE_BITS = 43;
 
-// ============================================================================
-// 6) RX GROUPING/DEBOUNCE (detect repeated presses as one logical event)
-// ============================================================================
+// ---- 6) RX grouping/debounce (treat repeated presses as one) ---------------
 namespace {
-inline constexpr uint32_t kRxGroupGapMs = 350; // Gap to start a new group (ms)
-inline constexpr uint32_t kRxGroupMaxMs = 3000; // Max group lifetime (ms)
-inline constexpr uint8_t kRxGroupMaxFrames = 24; // Max frames per group
-inline constexpr uint32_t kRxFirstFrameHoldMs = 450; // Hold time before first publish (ms)
+inline constexpr uint32_t kRxGroupGapMs = 350;
+inline constexpr uint32_t kRxGroupMaxMs = 3000;
+inline constexpr uint8_t kRxGroupMaxFrames = 24;
+inline constexpr uint32_t kRxFirstFrameHoldMs = 450;
 
-// Adaptive hold calculation parameters (internal/private)
-inline constexpr uint32_t kRxAdaptiveNum = 5; // Numerator for adaptive hold
-inline constexpr uint32_t kRxAdaptiveDen = 2; // Denominator for adaptive hold
+inline constexpr uint32_t kRxAdaptiveNum = 5;
+inline constexpr uint32_t kRxAdaptiveDen = 2;
 } // namespace
 
-// ============================================================================
-// 7) SCOM SEMANTICS
-// ============================================================================
-// (Converted to constexpr — used only in runtime code.)
-constexpr uint8_t FUNKBUS_SCOM_RESTART_ON = 0; // SCOM bit meaning: restart ON
-constexpr uint8_t FUNKBUS_SCOM_RESTART_OFF = 1; // SCOM bit meaning: restart OFF
-constexpr uint8_t FUNKBUS_SCOM_SHORT_MAX = 3; // Frames <= this are considered SHORT (tap)
+// ---- 7) SCOM semantics ------------------------------------------------------
+constexpr uint8_t FUNKBUS_SCOM_RESTART_ON = 0;
+constexpr uint8_t FUNKBUS_SCOM_RESTART_OFF = 1;
+constexpr uint8_t FUNKBUS_SCOM_SHORT_MAX = 3; // ≤ this => SHORT press
 
-// ============================================================================
-// 8) LOCAL BUFFERS & HOTPATH ATTRIBUTES
-// ============================================================================
+// ---- 8) Local buffers & hotpath attributes ---------------------------------
 namespace {
-inline constexpr size_t kRxPulseCap = 256; // Max pulses captured into local vector
+inline constexpr size_t kRxPulseCap = 256; // max pulses captured
 } // namespace
 
 #if defined(ESP32)
-#  define FB_IRAM IRAM_ATTR // Attribute to locate hot functions in IRAM
+#  define FB_IRAM IRAM_ATTR
 #else
-#  define FB_IRAM // No-op on non-ESP32
+#  define FB_IRAM
 #endif
 
-// ============================================================================
-// 9) PROFILING & DURATION LUT (perf instrumentation)
-// ============================================================================
-// Keep feature switches as macros (used in #if)
-#define FUNKBUS_BUILD_EARLYCUT 1 // Early exit after preamble+budget (1=on)
-#define FUNKBUS_RX_DECODE_PROF 1 // Enable RX decode profiling (1=on)
+// ---- 9) Profiling & duration LUT -------------------------------------------
+#define FUNKBUS_BUILD_EARLYCUT 1
+#define FUNKBUS_RX_DECODE_PROF 1
 
-// Convert pure thresholds/parameters to constexpr
-constexpr uint32_t FUNKBUS_RX_DECODE_PROF_LOG_US = 10000; // Only log if > this total time (µs)
-constexpr uint32_t FUNKBUS_RX_DECODE_PROF_MIN_MS = 3000; // Rate-limit profiling logs (ms)
+constexpr uint32_t FUNKBUS_RX_DECODE_PROF_LOG_US = 10000; // log if total > this
+constexpr uint32_t FUNKBUS_RX_DECODE_PROF_MIN_MS = 3000; // rate-limit logs
 
-// LUT binning parameters as constexpr (safe for array bounds)
-constexpr uint32_t FUNKBUS_LUT_BIN_US = 25; // Duration LUT bin width (µs)
-constexpr uint32_t FUNKBUS_LUT_MAX_US = 5000; // Duration LUT max value (µs)
+constexpr uint32_t FUNKBUS_LUT_BIN_US = 25;
+constexpr uint32_t FUNKBUS_LUT_MAX_US = 5000;
 
-// ============================================================================
-// 10) OPTIONAL: Trace non-Funkbus bursts (debug)
-// ============================================================================
-// Keep the feature toggle; convert the rate to constexpr
-#define FUNKBUS_FOREIGN_TRACE 1 // 1: enable logging of non-Funkbus bursts
-constexpr uint32_t FUNKBUS_FOREIGN_TRACE_RATE_MS = 5000; // Rate-limit foreign burst logs (ms)
+// ---- 10) Optional: trace non-Funkbus bursts --------------------------------
+#define FUNKBUS_FOREIGN_TRACE 1
+constexpr uint32_t FUNKBUS_FOREIGN_TRACE_RATE_MS = 5000;
 
-// ============================================================================
-// Symbols used by decoder and the LUT
-// ============================================================================
+// ---- Symbols used by decoder & LUT -----------------------------------------
 enum FbSym : uint8_t {
-  FB_SYM_INV = 0, // Invalid / out-of-range
-  FB_SYM_ONE = 1, // Bit '1' (long pulse)
-  FB_SYM_ZERO = 2, // Bit '0' (short pulse)
-  FB_SYM_PREH = 3, // Preamble HIGH
-  FB_SYM_PREL = 4 // Preamble LOW
+  FB_SYM_INV = 0,
+  FB_SYM_ONE = 1, // short
+  FB_SYM_ZERO = 2, // long
+  FB_SYM_PREH = 3,
+  FB_SYM_PREL = 4
 };
 
-// LUT mapping duration bins to symbol classification
+// Duration→symbol LUT
 static FbSym s_fb_durlut[(FUNKBUS_LUT_MAX_US / FUNKBUS_LUT_BIN_US) + 1];
 
-// Make the tiny helpers hot & inline (placed in IRAM when FUNKBUS_IRAM_HOT == 1)
 static inline FB_IRAM uint16_t fb_lut_idx(uint32_t us) {
   const uint32_t cap = FUNKBUS_LUT_MAX_US;
   return (us >= cap) ? (uint16_t)(cap / FUNKBUS_LUT_BIN_US)
                      : (uint16_t)(us / FUNKBUS_LUT_BIN_US);
 }
 
-// Build classifier from *your* thresholds (no need to be IRAM)
+// Build classifier from thresholds
 static void fb_init_duration_lut() {
   for (uint32_t us = 0; us <= FUNKBUS_LUT_MAX_US; us += FUNKBUS_LUT_BIN_US) {
     FbSym sym = FB_SYM_INV;
@@ -214,9 +173,8 @@ static inline FB_IRAM FbSym fb_classify_us(uint32_t us) {
   return s_fb_durlut[fb_lut_idx(us)];
 }
 
-// --------------------------- ISR-safe logging helpers ------------------------
+// ---- ISR-safe logging helpers ----------------------------------------------
 #if FB_ISR_LOG_ENABLE
-// Optional: pull ets_printf from available ROM header.
 #  if __has_include(<rom/ets_sys.h>)
 #    include <rom/ets_sys.h>
 #  elif __has_include(<esp32/rom/ets_sys.h>)
@@ -242,7 +200,7 @@ static volatile int s_fb_isr_log_left = FB_ISR_LOG_BUDGET;
     } while (0)
 #endif
 
-// Drop normal logs if we're in ISR (belt & suspenders)
+// Drop normal logs inside ISRs
 #define FB_LOGF_IF_NOT_ISR(call) \
   do {                           \
     if (!FB_IN_ISR()) {          \
@@ -250,23 +208,20 @@ static volatile int s_fb_isr_log_left = FB_ISR_LOG_BUDGET;
     }                            \
   } while (0)
 
-// ------------------------------ Derived constants ----------------------------
+// ---- Derived constants for grouping ----------------------------------------
 static constexpr uint32_t FB_GROUP_GAP_MS = kRxGroupGapMs;
 static constexpr uint32_t FB_GROUP_MAX_MS = kRxGroupMaxMs;
 static constexpr uint8_t FB_GROUP_MAX_FRAMES = kRxGroupMaxFrames;
 static constexpr uint32_t FB_FIRST_FRAME_HOLD_MS = kRxFirstFrameHoldMs;
 
-// =========================== ESP32 RMT globals ===============================
+// ---- ESP32 RMT globals ------------------------------------------------------
 static RingbufHandle_t s_rb = nullptr;
 static rmt_channel_t s_rmt_chan = (rmt_channel_t)FUNKBUS_RMT_RX_CHANNEL;
 static volatile bool s_rmt_running = false;
 static volatile int s_cs_level = 0;
 
-// ============================================================================
-// RMT helpers
-// ============================================================================
-
-// Start the RMT receiver if not already running (safe to call often).
+// ---- RMT helpers ------------------------------------------------------------
+// Start the RMT receiver if not already running.
 static void startRmtIfNeeded() {
   if (!s_rb) return;
   if (!s_rmt_running) {
@@ -283,21 +238,16 @@ static void stopRmtIfRunning() {
   }
 }
 
-// ============================================================================
-// ISR + Worker Task (debounced gating via GDO2)
-// ============================================================================
-
+// ---- ISR + Worker task (debounced GDO2 gating) ------------------------------
 extern "C" {
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 }
 
-// Observability counters (read from loop() only when debugging)
 static volatile uint32_t g_isr_notify_count = 0;
 static volatile uint32_t g_worker_wake_count = 0;
 static size_t g_max_ring_bytes_seen = 0;
 
-// Minimal ISR: edge flag + notify worker (no heap/prints here).
 static volatile bool s_edge_flag = false;
 static TaskHandle_t s_rxTask = nullptr;
 
@@ -313,23 +263,23 @@ static void IRAM_ATTR isr_carrier_rise() {
   }
 }
 
-// Worker task—debounced RMT on/off based on GDO2 "carrier select".
+// Worker task—debounced RMT on/off based on GDO2.
 static void rxWorkerTask(void* /*arg*/) {
   static uint32_t t_last_high = 0, t_last_low = 0, t_started = 0;
 
   for (;;) {
     const uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
-    if (!notified) continue; // timeout wake — ignore
+    if (!notified) continue;
     g_worker_wake_count += notified;
 
-    if (!s_edge_flag) continue; // rare mismatch
+    if (!s_edge_flag) continue;
     s_edge_flag = false;
 
     const uint32_t now = millis();
     int raw = gpio_get_level((gpio_num_t)FUNKBUS_CC1101_GDO2_MCU);
     const bool cs_high = FUNKBUS_CS_ACTIVE_HIGH ? (raw != 0) : (raw == 0);
 
-    // Debounced gating: require stability windows to start/stop RMT.
+    // Debounce start/stop windows for RMT.
     if (cs_high) {
       t_last_high = now;
       if (!s_rmt_running) {
@@ -360,7 +310,6 @@ static void fb_trace_unknown(const uint32_t* pulses, const uint8_t* /*levels*/, 
   if (now - s_last < FUNKBUS_FOREIGN_TRACE_RATE_MS) return;
   s_last = now;
 
-  // Print first few pulse durations (µs) so we can eyeball preambles later
   const size_t show = (pc < 16) ? pc : 16;
   char buf[192];
   char* p = buf;
@@ -375,39 +324,29 @@ static void fb_trace_unknown(const uint32_t* pulses, const uint8_t* /*levels*/, 
     p += w;
     left -= (size_t)w;
   }
-  // Use WARNING or NOTICE depending on your preference
   FB_VLOG("%s" CR, buf);
 }
 #endif
-// -----------------------------------------------------------------------------
 
-// ============================================================================
-// Bit helpers / Pulse extraction
-// ============================================================================
+// ---- Bit helpers / pulse extraction ----------------------------------------
 
 // Set bit at MSB-first index in a 48-bit accumulator.
 static inline void pack_bit48(uint64_t& acc, int bit, int bit_index) {
   if (bit) acc |= (1ULL << (FUNKBUS_FRAME_BITS - 1 - bit_index));
 }
 
-// Parse RMT items into pulse durations (us) and alternating levels.
-// Toggle once at top of file (if not already present)
-// #ifndef FUNKBUS_BUILD_EARLYCUT
-// #  define FUNKBUS_BUILD_EARLYCUT 1
-// #endif
-
+// Parse RMT items into pulse durations (µs) and alternating levels.
 static FB_IRAM size_t fb_build_pulses_levels(const rmt_item32_t* it, size_t n, uint32_t tick_us,
                                              uint32_t* pulses, uint8_t* levels, size_t cap) {
   size_t pc = 0;
 
 #if FUNKBUS_BUILD_EARLYCUT
-  // Walker needs ≤ 2*bits + a little headroom (48 → 100)
   const size_t needed_after_i = (FUNKBUS_FRAME_BITS * 2) + 4;
   size_t found_i = SIZE_MAX; // index of PRE_L once PRE_H→PRE_L seen
 #endif
 
   for (size_t i = 0; i < n && pc + 2 <= cap; ++i) {
-    // ---- half 0 ----
+    // half 0
     if (it[i].duration0) {
       const uint8_t l0 = it[i].level0 ? 1 : 0;
       if (pc == 0)
@@ -417,26 +356,22 @@ static FB_IRAM size_t fb_build_pulses_levels(const rmt_item32_t* it, size_t n, u
       pulses[pc++] = it[i].duration0 * tick_us;
 
 #if FUNKBUS_BUILD_EARLYCUT
-      // detect PRE_H (1,long) then PRE_L (0,mid)
       if (pc >= 2 && found_i == SIZE_MAX) {
         const size_t k0 = pc - 2, k1 = pc - 1;
         if (levels[k0] == 1 &&
             pulses[k0] >= FUNKBUS_PRE_H_MIN_US && pulses[k0] <= FUNKBUS_PRE_H_MAX_US &&
             levels[k1] == 0 &&
             pulses[k1] >= FUNKBUS_PRE_L_MIN_US && pulses[k1] <= FUNKBUS_PRE_L_MAX_US) {
-          found_i = k1; // index of PRE_L
+          found_i = k1;
         }
       }
-      // once preamble found, stop when we have enough pulses after it
       if (found_i != SIZE_MAX && pc >= (found_i + needed_after_i)) {
-        // levels[] already filled per append; post-pass no longer needed
-        // for (size_t j = 1; j < pc; ++j) levels[j] = 1 - levels[j - 1];
         return pc;
       }
 #endif
     }
 
-    // ---- half 1 ----
+    // half 1
     if (it[i].duration1) {
       const uint8_t l1 = it[i].level1 ? 1 : 0;
       if (pc == 0)
@@ -456,30 +391,25 @@ static FB_IRAM size_t fb_build_pulses_levels(const rmt_item32_t* it, size_t n, u
         }
       }
       if (found_i != SIZE_MAX && pc >= (found_i + needed_after_i)) {
-        // levels[] already filled per append; post-pass no longer needed
-        // for (size_t j = 1; j < pc; ++j) levels[j] = 1 - levels[j - 1];
         return pc;
       }
 #endif
     }
   }
-
   return pc;
 }
 
-// Find the LOW right after preamble HIGH (within threshold windows).
+// Find the LOW right after preamble HIGH (within thresholds).
 static FB_IRAM size_t fb_find_preamble_low(const uint32_t* pulses, const uint8_t* levels, size_t pc) {
-  // #if FUNKBUS_FAST_DECODE
-  // Fast path: classify durations via LUT built from your macros.
   for (size_t k = 0; k + 1 < pc; ++k) {
     const FbSym s0 = fb_classify_us(pulses[k]);
     const FbSym s1 = fb_classify_us(pulses[k + 1]);
     if (levels[k] == 1 && s0 == FB_SYM_PREH &&
         levels[k + 1] == 0 && s1 == FB_SYM_PREL) {
-      return k + 1; // index of LOW preamble part
+      return k + 1;
     }
   }
-  return SIZE_MAX; // not found
+  return SIZE_MAX;
 }
 
 // Walk pulses and assemble 48 bits (MSB-first) using fixed thresholds.
@@ -492,16 +422,15 @@ static FB_IRAM bool fb_walk_bits(const uint32_t* pulses, size_t pc, size_t start
     FbSym s0 = fb_classify_us(pulses[i]);
     if (s0 == FB_SYM_PREH || s0 == FB_SYM_PREL) s0 = FB_SYM_ZERO; // treat PRE* as long
 
-    if (s0 == FB_SYM_ZERO) {
+    if (s0 == FB_SYM_ZERO) { // long => ZERO (single)
       pack_bit48(bits_acc, 0, bits++);
       i += 1;
       continue;
     }
 
-    if (s0 == FB_SYM_ONE) {
+    if (s0 == FB_SYM_ONE) { // ONE => short + short
       if (i + 1 >= pc) break;
       FbSym s1 = fb_classify_us(pulses[i + 1]);
-      // for ONE we expect short+short; PRE* are long, so no coercion here
       if (s1 == FB_SYM_ONE) {
         pack_bit48(bits_acc, 1, bits++);
         i += 2;
@@ -510,7 +439,6 @@ static FB_IRAM bool fb_walk_bits(const uint32_t* pulses, size_t pc, size_t start
         break;
       }
     }
-
     break;
   }
 
@@ -519,51 +447,7 @@ static FB_IRAM bool fb_walk_bits(const uint32_t* pulses, size_t pc, size_t start
   return true;
 }
 
-// static bool fb_walk_bits_fast_shadow(const uint32_t* pulses, size_t pc, size_t start_idx, uint64_t& acc) {
-//   uint64_t bits_acc = 0;
-//   int bits = 0;
-//   size_t i = start_idx;
-
-//   while (bits < FUNKBUS_FRAME_BITS && i < pc) {
-//     FbSym s0 = fb_classify_us(pulses[i]);
-
-//     // In the bit-walk, consider PRE* windows as "long" (ZERO)
-//     if (s0 == FB_SYM_PREH || s0 == FB_SYM_PREL) s0 = FB_SYM_ZERO;
-
-//     // ZERO = long (single element)
-//     if (s0 == FB_SYM_ZERO) {
-//       pack_bit48(bits_acc, 0, bits++);
-//       i += 1;
-//       continue;
-//     }
-
-//     // ONE = short + short pair
-//     if (s0 == FB_SYM_ONE) {
-//       if (i + 1 >= pc) break;
-//       FbSym s1 = fb_classify_us(pulses[i + 1]);
-//       // Do NOT coerce PRE* to ONE (they're long).
-//       if (s1 == FB_SYM_ONE) {
-//         pack_bit48(bits_acc, 1, bits++);
-//         i += 2;
-//         continue;
-//       } else {
-//         break;
-//       }
-//     }
-
-//     // ambiguous
-//     break;
-//   }
-
-//   if (bits != FUNKBUS_FRAME_BITS) return false;
-//   acc = bits_acc;
-//   return true;
-// }
-
-// ============================================================================
-// Frame/field mapping and reverse decode
-// ============================================================================
-
+// ---- Frame/field mapping and reverse decode --------------------------------
 struct FunkbusFrame48 {
   uint64_t left48 = 0;
   uint64_t payload40 = 0;
@@ -574,7 +458,6 @@ struct FunkbusFrame48 {
   int bits_total = 0;
 };
 
-// Fill frame fields from accumulator; optional debug dump kept commented.
 static void fb_fill_out_and_log(uint64_t acc, FunkbusFrame48& out) {
   out.left48 = acc;
   out.payload40 = (acc >> FUNKBUS_TRAILER_BITS) & ((1ULL << FUNKBUS_PAYLOAD_BITS) - 1);
@@ -604,12 +487,10 @@ struct FunkbusDecoded {
   String serial_hex;
 };
 
-// Read an MSB-first bit from a 48-bit value.
 static inline uint8_t get_bit48(uint64_t v, int i) {
   return (uint8_t)((v >> (FUNKBUS_FRAME_BITS - 1 - i)) & 1ULL);
 }
 
-// Even parity over first 43 bits must match parity bit at position 4.
 static bool parity_even_first43(uint64_t left48) {
   uint32_t ones = 0;
   for (int i = 0; i < FUNKBUS_PARITY_RANGE_BITS; ++i) ones += get_bit48(left48, i);
@@ -618,7 +499,6 @@ static bool parity_even_first43(uint64_t left48) {
   return bit == expected;
 }
 
-// 4-bit checksum derived from first 43 bits (polynomial-like transform).
 static uint8_t checksum4_first43(uint64_t left48) {
   uint8_t xorv = 0, cur = 0;
   int cnt = 0;
@@ -641,7 +521,6 @@ static uint8_t checksum4_first43(uint64_t left48) {
   return (uint8_t)(res & 0x0F);
 }
 
-// Map Funkbus 3-bit button field to 1..8.
 static uint8_t decode_button_from_3bits(uint8_t b3) {
   switch (b3 & 0x7) {
     case 0b000:
@@ -664,7 +543,6 @@ static uint8_t decode_button_from_3bits(uint8_t b3) {
   return 0;
 }
 
-// Map Funkbus 2-bit channel to char (A,B,C,L).
 static char decode_channel2_to_char(uint8_t ch2) {
   switch (ch2 & 0x3) {
     case 0b00:
@@ -679,14 +557,12 @@ static char decode_channel2_to_char(uint8_t ch2) {
   return '?';
 }
 
-// Format 20-bit serial as 5-hex uppercase.
 static String serial20_to_hex5(uint32_t s20) {
   char buf[6];
   snprintf(buf, sizeof(buf), "%05X", (unsigned)(s20 & 0xFFFFF));
   return String(buf);
 }
 
-// Decode SCOM 3-bit (Gray-like) into 0..7 ordinal.
 static uint8_t decode_scom_from_bits(uint8_t scom3) {
   switch (scom3 & 0x7) {
     case 0b000:
@@ -709,7 +585,6 @@ static uint8_t decode_scom_from_bits(uint8_t scom3) {
   return 0xFF;
 }
 
-// Reverse-decode the 48-bit frame into structured fields for MQTT.
 static void fb_reverse_decode(const FunkbusFrame48& in, FunkbusDecoded& d) {
   const uint64_t left48 = in.left48, p40 = in.payload40;
   uint8_t scom3 = (uint8_t)((left48 >> 5) & 0x7);
@@ -765,10 +640,9 @@ static bool decode_funkbus_48(const rmt_item32_t* it, size_t n, uint32_t tick_us
   uint32_t t2 = micros();
 #endif
 
-  // --- clamp the bit-walk window (48 bits => need ≤ 2*48 + a few) ---
-  size_t pc_needed = i + (FUNKBUS_FRAME_BITS * 2) + 4; // e.g. 48 -> ~100
+  // Clamp walk window (48 bits ⇒ need ≤ ~100 durations).
+  size_t pc_needed = i + (FUNKBUS_FRAME_BITS * 2) + 4;
   if (pc_needed > pc) pc_needed = pc;
-  // ------------------------------------------------------------------
 
   uint64_t acc = 0;
   if (!fb_walk_bits(pulses, pc_needed, i, acc)) {
@@ -780,7 +654,6 @@ static bool decode_funkbus_48(const rmt_item32_t* it, size_t n, uint32_t tick_us
 
 #if FUNKBUS_RX_DECODE_PROF && FUNK_LOG_VERBOSE
   uint32_t t3 = micros();
-  // Only log slow paths, rate-limited
   static uint32_t s_last_prof_ms = 0;
   const uint32_t total_us = t3 - t0;
   const uint32_t now_ms = millis();
@@ -792,14 +665,12 @@ static bool decode_funkbus_48(const rmt_item32_t* it, size_t n, uint32_t tick_us
             (unsigned)(t3 - t2), (unsigned)total_us);
   }
 #endif
+
   fb_fill_out_and_log(acc, out);
   return true;
 }
 
-// ============================================================================
-// Grouping & MQTT publish
-// ============================================================================
-
+// ---- Grouping & MQTT publish -----------------------------------------------
 struct FbPressGroup {
   uint32_t serial20 = 0;
   char channel = '?';
@@ -816,7 +687,6 @@ struct FbPressGroup {
   bool seen2 = false, seen3 = false, seen4 = false, seen5 = false, seen6 = false, seen7 = false;
   char serial_hex[6] = {0};
 
-  // Reset the aggregation state.
   void reset() {
     serial20 = 0;
     channel = '?';
@@ -831,8 +701,6 @@ struct FbPressGroup {
     seen2 = seen3 = seen4 = seen5 = seen6 = seen7 = false;
     serial_hex[0] = '\0';
   }
-
-  // True if nothing has been aggregated yet.
   bool empty() const { return scom_count == 0; }
 };
 
@@ -841,18 +709,15 @@ static bool g_active = false;
 
 #if FUNKBUS_LED_RX_ENABLE
 static uint32_t s_led_off_at = 0;
-// Drive RX LED.
 static inline void rx_led_write(bool on) {
   digitalWrite(FUNKBUS_LED_RX_GPIO,
                (FUNKBUS_LED_ACTIVE_HIGH ? (on ? HIGH : LOW)
                                         : (on ? LOW : HIGH)));
 }
-// Short LED pulse to indicate activity.
 static inline void rx_led_pulse(uint32_t now_ms) {
   rx_led_write(true);
   s_led_off_at = now_ms + (uint32_t)FUNKBUS_LED_RX_MS;
 }
-// Turn LED off when pulse duration elapsed.
 static inline void rx_led_maintain(uint32_t now_ms) {
   if (s_led_off_at && (int32_t)(now_ms - s_led_off_at) >= 0) {
     rx_led_write(false);
@@ -861,13 +726,11 @@ static inline void rx_led_maintain(uint32_t now_ms) {
 }
 #endif // FUNKBUS_LED_RX_ENABLE
 
-// Test if incoming press matches the active group signature.
 static inline bool fb_same_signature(const FbPressGroup& g, uint32_t serial20, char channel,
                                      uint8_t button, bool action_on) {
   return g.serial20 == serial20 && g.channel == channel && g.button == button && g.action_on == action_on;
 }
 
-// Start a new press group aggregation.
 static inline void fb_group_start(FbPressGroup& g, uint32_t now_ms, uint32_t serial20, const char* serial_hex5,
                                   char channel, uint8_t button, bool action_on, uint8_t scom, bool battery_ok) {
   g.reset();
@@ -891,7 +754,6 @@ static inline void fb_group_start(FbPressGroup& g, uint32_t now_ms, uint32_t ser
   g.seen7 |= (scom == 7);
 }
 
-// Append another frame into the current group, update stats.
 static inline void fb_group_append(FbPressGroup& g, uint32_t now_ms, uint8_t scom, bool battery_ok) {
   const uint32_t gap = now_ms - g.last_ms;
   g.avg_gap_ms = (g.avg_gap_ms == 0) ? gap : ((g.avg_gap_ms + gap) >> 1);
@@ -908,7 +770,6 @@ static inline void fb_group_append(FbPressGroup& g, uint32_t now_ms, uint8_t sco
   g.seen7 |= (scom == 7);
 }
 
-// Make a comma-separated list of SCOMs (for logs).
 static String fb_scom_list(const FbPressGroup& g) {
   char buf[FB_GROUP_MAX_FRAMES * 2 + 8] = {0};
   char* p = buf;
@@ -919,25 +780,21 @@ static String fb_scom_list(const FbPressGroup& g) {
   return String(buf);
 }
 
-// Publish the grouped press as MQTT JSON on topic /RFtoMQTT/<serial>.
+// Publish grouped press as MQTT JSON on /RFtoMQTT/<serial>.
 static void fb_publish_group_result(const FbPressGroup& g, char duration_code) {
-  // Make lowercase serial once without creating a String
-  char serial_lc[6] = {0}; // 5 chars + NUL (adjust if your serial is longer)
+  char serial_lc[6] = {0};
   for (int i = 0; i < 5 && g.serial_hex[i]; ++i) {
     char c = g.serial_hex[i];
-    if (c >= 'A' && c <= 'F') c = (char)(c - 'A' + 'a'); // fast tolower for hex
+    if (c >= 'A' && c <= 'F') c = (char)(c - 'A' + 'a');
     serial_lc[i] = c;
   }
 
-  // Build topic without String concatenation
   char topic[64];
   snprintf(topic, sizeof(topic), "/RFtoMQTT/%s", serial_lc);
 
-  // Tiny fields as small C buffers (avoid temporary String objects)
   char chbuf[2] = {g.channel, '\0'};
   char dur[2] = {duration_code, '\0'};
 
-  // JSON stays the same size; fill with C buffers
   StaticJsonDocument<128> d;
   d["serial"] = serial_lc;
   d["channel"] = chbuf;
@@ -945,16 +802,12 @@ static void fb_publish_group_result(const FbPressGroup& g, char duration_code) {
   d["action"] = g.action_on ? "on" : "off";
   d["duration"] = dur;
 
-  // Reserve once so serializeJson doesn't grow the String multiple times
   String out;
   out.reserve(128);
   serializeJson(d, out);
-
-  // FB_LOG_N(F("[funkbus_rx->MQTT] topic='%s' payload=%s" CR), topic, out.c_str());
   pub(topic, out.c_str());
 }
 
-// If a “restart” SCOM appears mid-press under specific conditions, split.
 static inline bool fb_should_force_split_on_restart(const FbPressGroup& g, uint8_t incoming_scom) {
   if (g.action_on) {
     if (incoming_scom == FUNKBUS_SCOM_RESTART_ON && (g.seen2 || g.seen6)) return true;
@@ -964,28 +817,24 @@ static inline bool fb_should_force_split_on_restart(const FbPressGroup& g, uint8
   return false;
 }
 
-// Short/Long classification helper for logs.
 static inline const char* fb_press_type(uint8_t max_scom) {
   return (max_scom <= FUNKBUS_SCOM_SHORT_MAX) ? "SHORT" : "LONG";
 }
 
-// Flush active group immediately (log + MQTT publish).
 static void fb_group_flush_now() {
   if (!g_active || g_press.empty()) return;
   const uint32_t span_ms = g_press.last_ms - g_press.first_ms;
   String scom_seq = fb_scom_list(g_press);
-  FB_LOG_N(
-      "[funkbus_rx] serial=%s batt=%s ch=%c btn=%u action=%s scom_max=%u type=%s frames=%u duration=%ums scoms=%s\n",
-      g_press.serial_hex, g_press.battery_ok ? "LOW" : "OK", g_press.channel, (unsigned)g_press.button,
-      g_press.action_on ? "ON" : "OFF", (unsigned)g_press.max_scom, fb_press_type(g_press.max_scom),
-      (unsigned)g_press.scom_count, (unsigned)span_ms, scom_seq.c_str());
+  FB_LOG_N("[funkbus_rx] serial=%s batt=%s ch=%c btn=%u action=%s scom_max=%u type=%s frames=%u duration=%ums scoms=%s\n",
+           g_press.serial_hex, g_press.battery_ok ? "LOW" : "OK", g_press.channel, (unsigned)g_press.button,
+           g_press.action_on ? "ON" : "OFF", (unsigned)g_press.max_scom, fb_press_type(g_press.max_scom),
+           (unsigned)g_press.scom_count, (unsigned)span_ms, scom_seq.c_str());
   const char duration_code = (g_press.max_scom <= FUNKBUS_SCOM_SHORT_MAX) ? 's' : 'l';
   fb_publish_group_result(g_press, duration_code);
   g_press.reset();
   g_active = false;
 }
 
-// Flush group if gap/span thresholds reached (called from loop()).
 static void fb_group_flush_if_due(uint32_t now_ms) {
   if (!g_active || g_press.empty()) return;
   const uint32_t gap = now_ms - g_press.last_ms;
@@ -998,11 +847,10 @@ static void fb_group_flush_if_due(uint32_t now_ms) {
   const bool span_due = span_ms >= FB_GROUP_MAX_MS;
   if (gap_due || span_due) {
     String scom_seq = fb_scom_list(g_press);
-    FB_LOG_N(
-        "[funkbus_rx] serial=%s batt=%s ch=%c btn=%u action=%s scom_max=%u type=%s frames=%u duration=%ums scoms=%s\n",
-        g_press.serial_hex, g_press.battery_ok ? "LOW" : "OK", g_press.channel, (unsigned)g_press.button,
-        g_press.action_on ? "ON" : "OFF", (unsigned)g_press.max_scom, fb_press_type(g_press.max_scom),
-        (unsigned)g_press.scom_count, (unsigned)(span_ms), scom_seq.c_str());
+    FB_LOG_N("[funkbus_rx] serial=%s batt=%s ch=%c btn=%u action=%s scom_max=%u type=%s frames=%u duration=%ums scoms=%s\n",
+             g_press.serial_hex, g_press.battery_ok ? "LOW" : "OK", g_press.channel, (unsigned)g_press.button,
+             g_press.action_on ? "ON" : "OFF", (unsigned)g_press.max_scom, fb_press_type(g_press.max_scom),
+             (unsigned)g_press.scom_count, (unsigned)(span_ms), scom_seq.c_str());
     const char duration_code = (g_press.max_scom <= FUNKBUS_SCOM_SHORT_MAX) ? 's' : 'l';
     fb_publish_group_result(g_press, duration_code);
     g_press.reset();
@@ -1010,9 +858,7 @@ static void fb_group_flush_if_due(uint32_t now_ms) {
   }
 }
 
-// ============================================================================
-// Public API implementations
-// ============================================================================
+// ---- Public API implementations --------------------------------------------
 
 // Temporarily disable RX during TX to avoid artifacts and buffer churn.
 void FunkbusRx::pauseForTx() {
@@ -1028,9 +874,9 @@ void FunkbusRx::resumeAfterTx() {
 
   FunkbusTB::setMHz(FunkbusTB::GetPersistedMhz());
 
-  // Fast hop TX->RX; NO extra waits around this.
+  // Fast hop TX→RX; full apply only if fast fails.
   if (!FunkbusTB::switchTxToRxFast(20)) {
-    (void)assureRxReady(true); // full apply only if fast fails
+    (void)assureRxReady(true);
   }
 
 #if FUNKBUS_RX_GATE_BY_CS
@@ -1045,18 +891,17 @@ void FunkbusRx::resumeAfterTx() {
 #endif
 }
 
-// One-time initialization—listen freq setup, RMT config, worker task, LED.
+// One-time init — listen freq, RMT, worker task, LED, LUT.
 void FunkbusRx::begin() {
   using namespace FunkbusTB;
   FunkbusTB::EnsureListenFreqInitialized();
   (void)assureRxReady(20);
 
-  // Worker task (optional but recommended)
   if (s_rxTask == nullptr) {
     BaseType_t ok = xTaskCreatePinnedToCore(
         rxWorkerTask, "fb_rx", kRxWorkerStack, nullptr,
         kRxWorkerPrio, &s_rxTask, kRxWorkerCore);
-    if (ok != pdPASS) s_rxTask = nullptr; // continue without offload
+    if (ok != pdPASS) s_rxTask = nullptr;
   }
 
   // RMT RX config
@@ -1089,19 +934,18 @@ void FunkbusRx::begin() {
 
 #if FUNKBUS_LED_RX_ENABLE
   pinMode(FUNKBUS_LED_RX_GPIO, OUTPUT);
-  // ensure LED starts OFF
+  // LED starts OFF
   digitalWrite(FUNKBUS_LED_RX_GPIO, (FUNKBUS_LED_ACTIVE_HIGH ? LOW : HIGH));
 #endif
 
   fb_init_duration_lut();
 }
 
-// Main RX polling—drains RMT ringbuffer, decodes, groups, publishes.
+// Main RX polling — drain RMT ringbuffer, decode, group, publish.
 void FunkbusRx::loop() {
   if (!s_rb) return;
 
 #if FUNKBUS_RX_DEBUG
-  // Optional periodic debug dump (statistics)
   static uint32_t last_dbg = 0;
   const uint32_t now_dbg = millis();
   if (now_dbg - last_dbg >= FUNKBUS_RX_DEBUG_PERIOD_MS) {
@@ -1117,7 +961,6 @@ void FunkbusRx::loop() {
 #endif
 
 #if FUNKBUS_LED_RX_ENABLE
-  // Maintain LED pulse window precisely even when idle
   rx_led_maintain(millis());
 #endif
 
@@ -1131,7 +974,6 @@ void FunkbusRx::loop() {
   }
 
 #if FUNKBUS_LED_RX_ENABLE
-  // Any activity → blip the LED
   rx_led_pulse(millis());
 #endif
 
