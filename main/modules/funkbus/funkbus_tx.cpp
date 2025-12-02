@@ -566,7 +566,7 @@ static void PublishCC1101RegistersJson() {
 #endif
 
 // ============================================================================
-// 17) CC1101 TX frequency guard (RAII) — hop to TX MHz, then restore
+// 17) CC1101 TX frequency guard (moved to toolbox)
 // ============================================================================
 #if FUNKBUS_REG_DUMPS >= 1
 #  define DUMP_REGS() FunkbusTB::DumpRegistersHexLogs()
@@ -575,25 +575,6 @@ static void PublishCC1101RegistersJson() {
     do {              \
     } while (0)
 #endif
-
-namespace {
-struct TxFreqGuard {
-  float prev = NAN;
-  explicit TxFreqGuard(float tx_mhz) {
-#ifdef ZradioCC1101
-    prev = FunkbusTB::GetPersistedMhz();
-    FunkbusTB::setMHz(tx_mhz);
-    DUMP_REGS();
-#endif
-  }
-  ~TxFreqGuard() {
-#ifdef ZradioCC1101
-    if (!isnan(prev)) FunkbusTB::setMHz(prev);
-    DUMP_REGS();
-#endif
-  }
-};
-} // namespace
 
 // ============================================================================
 // 18) Extended RAW TX command (validation/logging + dispatch)
@@ -1278,7 +1259,7 @@ void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
     frames_ptr.push_back(frames_buf[i].data());
   }
 
-  TxFreqGuard _guard(FUNKBUS_TX_MHZ);
+  FunkbusTB::TxFreqGuard _guard(FUNKBUS_TX_MHZ);
   FunkbusTB::beginTxSession();
 
 #  if FUNKBUS_LED_TX_ENABLE
@@ -1433,14 +1414,6 @@ bool FunkbusRemote::HandleCc1101Command(const String& json) {
 // 24) Debug helper: solid OOK carrier for ms
 // ============================================================================
 void FunkbusRemote::Debug_TxCarrierMs(uint32_t ms) {
-#ifdef ZradioCC1101
-  FunkbusTB::beginTxSession();
-  pinMode(FUNKBUS_CC1101_GDO0_MCU, OUTPUT);
-  digitalWrite(FUNKBUS_CC1101_GDO0_MCU, HIGH);
-  delay(ms);
-  digitalWrite(FUNKBUS_CC1101_GDO0_MCU, LOW);
-  FunkbusTB::endTxSession();
-#else
-  (void)ms;
-#endif
+  // Forwarded to toolbox implementation (no functional change).
+  FunkbusTB::Debug_TxCarrierMs(ms);
 }

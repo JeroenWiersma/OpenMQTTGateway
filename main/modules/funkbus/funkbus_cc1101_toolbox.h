@@ -230,4 +230,17 @@ void selfTest_RxTxTransitions();
 // Program a test frequency, verify, and restore previous setting.
 void selfTest_Frequency(uint32_t freq_hz);
 
+// ---- TX helpers (shared by tx/gateway) -------------------------------------
+// RAII guard: hop to a TX MHz and restore previous listen MHz on destruction.
+// Safe no-op on builds without ZradioCC1101.
+struct TxFreqGuard {
+  float prev = NAN;
+  explicit TxFreqGuard(float tx_mhz);
+  ~TxFreqGuard();
+};
+
+// Debug helper: hold OOK carrier HIGH for 'ms' milliseconds, then restore RX.
+// Safe no-op on builds without ZradioCC1101.
+void Debug_TxCarrierMs(uint32_t ms);
+
 } // namespace FunkbusTB

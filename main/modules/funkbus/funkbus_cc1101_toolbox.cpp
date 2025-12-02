@@ -9,6 +9,15 @@
 #include "funkbus_log.h" // unified logging shims
 #include "funkbus_rx.h" // RX pause/resume hooks used by TX session
 
+// Local dump macro aligned with FUNKBUS_REG_DUMPS
+#if FUNKBUS_REG_DUMPS >= 1
+#  define TB_DUMP_REGS() FunkbusTB::DumpRegistersHexLogs()
+#else
+#  define TB_DUMP_REGS() \
+    do {                 \
+    } while (0)
+#endif
+
 // -----------------------------------------------------------------------------
 // CC1101 calibration window (override via build flag if needed)
 // -----------------------------------------------------------------------------
@@ -837,4 +846,46 @@ void FunkbusTB::selfTest_Frequency(uint32_t freq_hz) {
   FB_LOG_N(F("[FunkbusTB][Selftest] Frequency restored (%u Hz), MARC=%s" CR),
            (unsigned)readProgrammedFrequencyHz(FUNKBUS_CC1101_XTAL_HZ),
            marcName(readMarc5()));
+}
+
+// -----------------------------------------------------------------------------
+// TX helpers shared by modules
+// -----------------------------------------------------------------------------
+
+// RAII hop to TX MHz and restore previous listen MHz on destruction.
+FunkbusTB::TxFreqGuard::TxFreqGuard(float tx_mhz) {
+#ifdef ZradioCC1101
+  prev = FunkbusTB::GetPersistedMhz();
+  FunkbusTB::setMHz(tx_mhz);
+  TB_DUMP_REGS();
+#else
+  (void)tx_mhz;
+#endif
+}
+
+FunkbusTB::TxFreqGuard::~TxFreqGuard() {
+#ifdef ZradioCC1101
+  if (!isnan(prev)) {
+    FunkbusTB::setMHz(prev);
+  }
+  TB_DUMP_REGS();
+#endif
+}
+
+// Hold OOK HIGH for 'ms' then restore RX.
+void FunkbusTB::Debug_TxCarrierMs(uint32_t ms) {
+#ifdef ZradioCC1101
+  FunkbusTB::beginTxSession();
+#  if defined(FUNKBUS_CC1101_GDO0_MCU)
+  pinMode(FUNKBUS_CC1101_GDO0_MCU, OUTPUT);
+  digitalWrite(FUNKBUS_CC1101_GDO0_MCU, HIGH);
+  delay(ms);
+  digitalWrite(FUNKBUS_CC1101_GDO0_MCU, LOW);
+#  else
+  (void)ms;
+#  endif
+  FunkbusTB::endTxSession();
+#else
+  (void)ms;
+#endif
 }
