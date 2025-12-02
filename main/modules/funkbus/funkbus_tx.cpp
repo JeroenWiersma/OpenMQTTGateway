@@ -1225,39 +1225,145 @@ void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
                                               const String& action,
                                               const String& duration) {
 #ifdef ZradioCC1101
-  (void)channel;
-  (void)button;
-
   if (bits40.length() != FIRST40_BITS) {
     FB_LOG_E(F("bits40 must be 40 bits (got %d)" CR), bits40.length());
     return;
   }
 
-  static const uint8_t SEQ_S_ON[] = {0, 2, 2, 2};
-  static const uint8_t SEQ_S_OFF[] = {1, 3, 3, 3};
-  static const uint8_t SEQ_L_ON[] = {0, 4, 4, 6};
-  static const uint8_t SEQ_L_OFF[] = {1, 5, 5, 7};
+  const bool is_on = (action == "ON");
+  const bool is_long = (duration == "L");
+  const bool is_ls = (channel == "LS");
 
-  const uint8_t* seq = (duration == "L")
-                           ? ((action == "ON") ? SEQ_L_ON : SEQ_L_OFF)
-                           : ((action == "ON") ? SEQ_S_ON : SEQ_S_OFF);
+  // ---------------------------------------------------------------------------
+  // 1) Prepare first40 variants (normal + flipped ON/OFF bit)
+  // ---------------------------------------------------------------------------
 
-  std::array<std::array<char, FRAME_STRLEN>, FUNKBUS_TX_FRAMES_PER_BURST> frames_buf;
+  char first40_main[FIRST40_STRLEN];
+  std::memcpy(first40_main, bits40.c_str(), FIRST40_BITS);
+  first40_main[FIRST40_BITS] = '\0';
+
+  // Flip the ON/OFF bit (position 40 if you start counting from 1).
+  // bits[0..39] -> bit 40 is index FIRST40_BITS-1.
+  char first40_flip[FIRST40_STRLEN];
+  std::memcpy(first40_flip, first40_main, FIRST40_STRLEN);
+  first40_flip[FIRST40_BITS - 1] =
+      is_on ? FUNKBUS_ACT_OFF[0] : FUNKBUS_ACT_ON[0];
+
+  struct FrameSeed {
+    const char* first40;
+    uint8_t scom;
+  };
+
+  std::vector<FrameSeed> seeds;
+
+  // ---------------------------------------------------------------------------
+  // 2) Build list of (first40, SCOM) seeds according to URH analysis
+  // ---------------------------------------------------------------------------
+
+  if (!is_long) {
+    // --- Short press: always 4 frames ---------------------------------------
+    //
+    // LS:
+    //   ON  -> 1,3,3,3
+    //   OFF -> 0,2,2,2
+    //
+    // A/B/C:
+    //   ON  -> 0,2,2,2
+    //   OFF -> 1,3,3,3
+
+    static const uint8_t SEQ_S_LS_ON[] = {1, 3, 3, 3};
+    static const uint8_t SEQ_S_LS_OFF[] = {0, 2, 2, 2};
+    static const uint8_t SEQ_S_CH_ON[] = {0, 2, 2, 2};
+    static const uint8_t SEQ_S_CH_OFF[] = {1, 3, 3, 3};
+
+    const uint8_t* seq = nullptr;
+    if (is_ls) {
+      seq = is_on ? SEQ_S_LS_ON : SEQ_S_LS_OFF;
+    } else {
+      seq = is_on ? SEQ_S_CH_ON : SEQ_S_CH_OFF;
+    }
+
+    for (int i = 0; i < 4; ++i) {
+      seeds.push_back(FrameSeed{first40_main, seq[i]});
+    }
+
+  } else {
+    // --- Long press: variable number of frames ------------------------------
+
+    const int repeat = (FUNKBUS_LONGPRESS_REPEAT > 0)
+                           ? FUNKBUS_LONGPRESS_REPEAT
+                           : 1;
+
+    if (is_on) {
+      // ON:
+      //   0,0,4,4,6 ... 6, 6,6
+      //
+      // The last two 6-frames use the 40-bit prefix with ON/OFF bit forced to 0.
+
+      // Prefix
+      seeds.push_back({first40_main, 0});
+      seeds.push_back({first40_main, 0});
+      seeds.push_back({first40_main, 4});
+      seeds.push_back({first40_main, 4});
+
+      // Repeating 6-frames while button is held
+      for (int i = 0; i < repeat; ++i) {
+        seeds.push_back({first40_main, 6});
+      }
+
+      // Two trailing 6-frames with ON/OFF bit = OFF
+      seeds.push_back({first40_flip, 6});
+      seeds.push_back({first40_flip, 6});
+
+    } else {
+      // OFF:
+      //   1,1,5,5,7 ... 7,6,6
+      //
+      // All frames use the normal OFF first40.
+
+      // Prefix
+      seeds.push_back({first40_main, 1});
+      seeds.push_back({first40_main, 1});
+      seeds.push_back({first40_main, 5});
+      seeds.push_back({first40_main, 5});
+
+      // Repeating 7-frames while button is held
+      for (int i = 0; i < repeat; ++i) {
+        seeds.push_back({first40_main, 7});
+      }
+
+      // Trailing 6,6
+      seeds.push_back({first40_main, 6});
+      seeds.push_back({first40_main, 6});
+    }
+  }
+
+  if (seeds.empty()) {
+    FB_LOG_E(F("[funkbus_tx] no frames to send" CR));
+    return;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 3) Build 48-bit frames into local buffers
+  // ---------------------------------------------------------------------------
+
+  std::vector<std::array<char, FRAME_STRLEN>> frames_buf(seeds.size());
   std::vector<const char*> frames_ptr;
-  frames_ptr.reserve(FUNKBUS_TX_FRAMES_PER_BURST);
+  frames_ptr.reserve(seeds.size());
 
-  char first40[FIRST40_STRLEN];
-  std::memcpy(first40, bits40.c_str(), FIRST40_BITS);
-  first40[FIRST40_BITS] = '\0';
-
-  for (int i = 0; i < FUNKBUS_TX_FRAMES_PER_BURST; ++i) {
-    const uint8_t scom = seq[i];
-    if (!Build48BitFrame_buf(first40, scom, frames_buf[i].data(), NULL)) {
-      FB_LOG_E(F("Build48BitFrame_buf failed at idx %d" CR), i);
+  for (size_t i = 0; i < seeds.size(); ++i) {
+    const auto& fs = seeds[i];
+    if (!Build48BitFrame_buf(fs.first40, fs.scom, frames_buf[i].data(),
+                             nullptr)) {
+      FB_LOG_E(F("Build48BitFrame_buf failed at idx %d" CR), (int)i);
       return;
     }
     frames_ptr.push_back(frames_buf[i].data());
   }
+
+  // ---------------------------------------------------------------------------
+  // 4) TX via CC1101 + ESP32 RMT (or GPIO fallback)
+  // ---------------------------------------------------------------------------
 
   FunkbusTB::TxFreqGuard _guard(FUNKBUS_TX_MHZ);
   FunkbusTB::beginTxSession();
@@ -1275,10 +1381,12 @@ void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
     if (ok_main) {
       const uint32_t clk_main_hz = txMain.counter_hz();
 
-      for (int i = 0; i < FUNKBUS_TX_FRAMES_PER_BURST; ++i) {
-        const char* bits_cstr = frames_buf[i].data();
-        String bits(bits_cstr);
-        String hex = BitsToHex(bits);
+#  if FUNK_LOG_VERBOSE
+      // Optional: debug dump of each 48-bit frame (now supports variable count)
+      for (size_t i = 0; i < frames_ptr.size(); ++i) {
+        const char* bits_cstr = frames_ptr[i];
+        String bits_str(bits_cstr);
+        String hex = BitsToHex(bits_str);
 
         char scom3[4];
         scom3[0] = bits_cstr[SCOM_START_BIT + 0];
@@ -1292,8 +1400,9 @@ void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
             (scom3[2] == '1' ? 4 : 0);
 
         FB_VLOG(F("[fb tx] frame[%d] scom=%u (%s) hex=%s bits=%s" CR),
-                i, scom, scom3, hex.c_str(), bits_cstr);
+                (int)i, scom, scom3, hex.c_str(), bits_cstr);
       }
+#  endif
 
       SendFramesWithStateMachine48(frames_ptr, txMain, clk_main_hz);
 
@@ -1303,7 +1412,7 @@ void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
 
       FB_LOG_N(F("[funkbus_tx] ch=%s btn=%u action=%s frames=%d duration=%s" CR),
                channel.c_str(), (unsigned)button, action.c_str(),
-               FUNKBUS_TX_FRAMES_PER_BURST, (duration == "L") ? "L" : "S");
+               (int)frames_ptr.size(), is_long ? "L" : "S");
 
       FunkbusTB::endTxSession();
       return;
@@ -1321,9 +1430,12 @@ void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
       const uint16_t PRE_H = FUNKBUS_PREAMBLE_LEADIN_US;
       const uint16_t PRE_L = FUNKBUS_PREAMBLE_LEADOUT_US;
       const uint16_t H = FUNKBUS_HALF_BIT_US;
+
       pushSeg(segs_one, 0, FUNKBUS_TX_PREROLL_US);
       pushSeg(segs_one, 1, PRE_H);
       pushSeg(segs_one, 0, PRE_L);
+
+      // Same Manchester encoding as BitsToSegments_noalloc48()
       uint8_t level = 1;
       for (size_t j = 0; j < FRAME_BITS; ++j) {
         const char b = bits[j];
@@ -1336,7 +1448,10 @@ void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
           pushSeg(segs_one, level, H);
         }
       }
-      if (level == 0) pushSeg(segs_one, 1, H);
+
+      if (level == 0) {
+        pushSeg(segs_one, 1, H);
+      }
       pushSeg(segs_one, 0, H);
       pushSeg(segs_one, 1, H);
       pushSeg(segs_one, 0, H);
@@ -1354,7 +1469,7 @@ void FunkbusRemote::Create_and_TransmitFrames(const String& bits40,
 
   FB_LOG_N(F("[funkbus_tx] ch=%s btn=%u action=%s frames=%d duration=%s" CR),
            channel.c_str(), (unsigned)button, action.c_str(),
-           FUNKBUS_TX_FRAMES_PER_BURST, (duration == "L") ? "L" : "S");
+           (int)frames_ptr.size(), is_long ? "L" : "S");
 
   FunkbusTB::endTxSession();
 #else

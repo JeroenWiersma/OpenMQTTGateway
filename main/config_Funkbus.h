@@ -84,6 +84,17 @@ extern void XtoFunkbus(const char* topicOri, JsonObject& RFdata); // handle MQTT
 #  endif
 
 // -----------------------------------------------------------------------------
+// 4b) Long-press repeat count
+// -----------------------------------------------------------------------------
+
+// How many times the repeating frame (6 for ON, 7 for OFF) is sent while
+// the button is held. This is in addition to the fixed prefix/suffix frames.
+// Remote observation suggests a small value; 2 is a good starting point.
+#  ifndef FUNKBUS_LONGPRESS_REPEAT
+#    define FUNKBUS_LONGPRESS_REPEAT 2
+#  endif
+
+// -----------------------------------------------------------------------------
 // 5) LOGGING VERBOSITY
 // -----------------------------------------------------------------------------
 
